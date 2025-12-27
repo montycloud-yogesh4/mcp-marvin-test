@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: 2010-09-09
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: "BucketOwnerFullControl"
+      BucketName: !Join
+        - "-"
+        - - "wafr-comp-ct-s3"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: s3-access-logs/
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        !Join [
+          "-",
+          [
+            "war-test-logging-bucket",
+            !Select [2, !Split ["/", !Ref AWS::StackId]],
+          ],
+        ]
+  S3BucketPolicy:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action:
+              - "s3:GetBucketAcl"
+            Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action:
+              - "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+  WartestkmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for wartestKinesisStreamNonCompliant
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - "kms:*"
+            Resource: "*"
+  WARTestTrail:
+    DependsOn:
+      - S3BucketPolicy
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      S3BucketName: !Ref S3Bucket
+      EnableLogFileValidation: true
+      KMSKeyId: !GetAtt [WartestkmsKey, Arn]
+      AdvancedEventSelectors:
+        - Name: "Management events selector"
+          FieldSelectors:
+            - Field: "eventCategory"
+              Equals:
+                - "Management"
+      IsLogging: true
+      TrailName: !Join
+        - "-"
+        - - "wafr-comp-ct"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchLogsRole.Arn
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "${AWS::StackName}-cloudtrail-logs"
+
+  CloudTrailCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailCloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogStream
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - kms:Decrypt
+                Resource:
+                  - !Sub arn:aws:s3:::${S3Bucket}/*
+                  - !Sub arn:aws:s3:::${S3Bucket}
+                  - !GetAtt [WartestkmsKey, Arn]
+
+  # SNS Topic for alarm notifications
+  AlarmTopic:
+    Type: "AWS::SNS::Topic"
+
+  MyLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.handler"
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: "nodejs18.x"
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            console.log("Event: ", JSON.stringify(event, null, 2));
+            return {
+              statusCode: 200,
+              body: JSON.stringify('Hello from Lambda!'),
+            };
+          };
+
+  LambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LambdaExecutionPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action: "sns:Publish"
+                Resource: !Ref AlarmTopic
+
+  MySNSSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: "lambda"
+      Endpoint: !GetAtt MyLambdaFunction.Arn
+
+  LambdaInvokePermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref MyLambdaFunction
+      Principal: "sns.amazonaws.com"
+      SourceArn: !Ref AlarmTopic
+
+  MyLambdaDeleteS3ExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Join
+        - "-"
+        - - "lambda-execution-role"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  DeleteS3LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Timeout: 120
+      Runtime: python3.11
+      Handler: "index.handler"
+      Environment:
+        Variables:
+          Account: !Ref AWS::AccountId
+          S3BucketName: !Ref S3Bucket
+      Role: !GetAtt MyLambdaDeleteS3ExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import os
+          def handler(event, context):
+            responseData = {}
+            if event["RequestType"] == "Delete":
+              try:
+                s3 = boto3.resource('s3')
+                bucket = s3.Bucket(os.environ['S3BucketName'])
+                bucket.objects.all().delete()
+                bucket.delete(ExpectedBucketOwner=os.environ['Account'])
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                return
+              except:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                return
+            else:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              return
+
+  DeleteS3CustomResource:
+    Type: Custom::DeleteS3
+    Properties:
+      ServiceToken: !GetAtt DeleteS3LambdaFunction.Arn
+      ServiceTimeout: 120
+Outputs:
+  WARTestTrailId:
+    Description: CloudTrail ID
+    Value: !Ref WARTestTrail
+  WARTestTrailArn:
+    Description: CloudTrail Arn
+    Value: !GetAtt "WARTestTrail.Arn"
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value:
+      Ref: S3Bucket
+  S3BucketArn:
+    Description: S3 Bucket Arn
+    Value: !GetAtt "S3Bucket.Arn"
+  AccountIdRegion:
+    Description: AccountIdRegion
+    Value: !Join ["", [!Ref AWS::AccountId, "/", !Ref AWS::Region]]
+  CloudTrailLogGroupName:
+    Description: CloudTrail log group
+    Value:
+      Ref: CloudTrailLogGroup
+    Export:
+      Name: CLOUDTRAILLOGGROUP
+  AlarmTopicID:
+    Description: Alarm Topic ID
+    Value:
+      Ref: AlarmTopic
+    Export:
+      Name: ALARMTOPICID
