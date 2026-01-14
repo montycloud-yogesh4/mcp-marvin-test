@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Enable AWS Inspector for an EC2 instance and launch the EC2 instance.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  EnableInspectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonInspectorFullAccess
+      Policies:
+        - PolicyName: CustomInspectorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "iam:CreateServiceLinkedRole"
+                  - "inspector2:Enable"
+                  - "inspector2:Disable"
+                  - "inspector2:ListFindings"
+                  - "inspector2:ListRulesPackages"
+                Resource: "*"
+
+  EnableInspectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 30
+      FunctionName: EnableInspectorFunction
+      Role: !GetAtt EnableInspectorRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              print(event)
+              client = boto3.client('inspector2')
+              response_data = {}
+              try:
+                  request_type = event['RequestType']
+                  if request_type == 'Create':
+                      print("Create event received")
+                      response = client.enable(
+                          resourceTypes=[
+                              "EC2",
+                              "ECR",
+                              "LAMBDA",
+                              "LAMBDA_CODE"
+                          ]
+                      )
+                      print(response)
+                      response_data['Message'] = "Enabled AWS Inspector successfully"
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  elif request_type == 'Delete':
+                      print("Delete event received")
+                      response = client.disable(
+                          resourceTypes=[
+                              "EC2",
+                              "ECR",
+                              "LAMBDA",
+                              "LAMBDA_CODE"
+                          ]
+                      )
+                      print(response)
+                      response_data['Message'] = "Disabled AWS Inspector successfully"
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  else:
+                      print(f"Unexpected event received: {request_type}")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Exception occurred: {e}")
+                  response_data['Message'] = f"Operation unsuccessful: {str(e)}"
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+      Environment:
+        Variables:
+          accountid: !Sub ${AWS::AccountId}
+
+  enableInspectorResource:
+    Type: Custom::EnableInspector
+    DependsOn: EnableInspectorFunction
+    Properties:
+      ServiceToken: !GetAtt EnableInspectorFunction.Arn
+      ResourceArn: !Sub arn:aws:inspector2:${AWS::Region}:${AWS::AccountId}:resource/${AWS::StackName}
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  EC2KeyPairTest:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Join
+        - "-"
+        - - "mykeypair"
+          - !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - "/"
+                  - !Ref "AWS::StackId"
+
+  MyEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonInspectorFullAccess
+      Policies:
+        - PolicyName: CustomInspectorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeTags"
+                  - "inspector2:ListFindings"
+                  - "inspector2:DescribeFindings"
+                  - "inspector2:CreateAssessmentTarget"
+                  - "inspector2:DeleteAssessmentTarget"
+                  - "inspector2:CreateAssessmentTemplate"
+                  - "inspector2:DeleteAssessmentTemplate"
+                  - "inspector2:ListAssessmentTargets"
+                  - "inspector2:ListAssessmentTemplates"
+                  - "inspector2:ListRulesPackages"
+                  - "inspector2:DescribeAssessmentTargets"
+                  - "inspector2:DescribeAssessmentTemplates"
+                  - "inspector2:DescribeRulesPackages"
+                Resource: "*"
+
+  MyEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref MyEC2Role
+
+  MyEC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: t3.nano
+      KeyName: !Ref EC2KeyPairTest
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref MyEC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: MyEC2Instance
+
+  MyResourceGroup:
+    Type: AWS::Inspector::ResourceGroup
+    Properties:
+      ResourceGroupTags:
+        - Key: Name
+          Value: MyEC2Instance
+
+  MyAssessmentTarget1:
+    Type: AWS::Inspector::AssessmentTarget
+    Properties:
+      AssessmentTargetName: !Sub
+        - ebs-snapshot-${AWS::AccountId}-${RandomGUID}
+        - RandomGUID: !Select
+            - 0
+            - !Split
+              - "-"
+              - !Select
+                - 2
+                - !Split
+                  - /
+                  - !Ref AWS::StackId
+      ResourceGroupArn: !GetAtt MyResourceGroup.Arn
+
+  InspectorAssessmentTemplate:
+    Type: AWS::Inspector::AssessmentTemplate
+    Properties:
+      DurationInSeconds: 3600
+      RulesPackageArns:
+        - arn:aws:inspector:us-east-1:316112463485:rulespackage/0-gEjTy7T7
+        - arn:aws:inspector:us-east-1:316112463485:rulespackage/0-rExsr2X8
+      AssessmentTargetArn: !Ref MyAssessmentTarget1
+      AssessmentTemplateName: "InspectorAssessmentTemplate"
+
+Outputs:
+  enableInspectorResource:
+    Description: Custom Resource to enable or disable Inspector
+    Value: !Ref enableInspectorResource
+  AccountIdRegion:
+    Description: inspector enabled account ID and region
+    Value: !Sub "${AWS::AccountId}/${AWS::Region}"
+  EnableInspectorFunction:
+    Description: Lambda to Enable or Disable Inspector with Respective Resource Type
+    Value: !Ref EnableInspectorFunction
+  EC2InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref MyEC2Instance
+  LambdaFunctionArn:
+    Description: ID of the EC2 instance
+    Value: !GetAtt EnableInspectorFunction.Arn
+  EC2PublicDNS:
+    Description: Public DNS of the EC2 instance
+    Value: !GetAtt MyEC2Instance.PublicDnsName

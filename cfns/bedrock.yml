@@ -1,0 +1,149 @@
+# ========== Non-Compliant Examples (each violates different TC failures) ==========
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Non-compliant: missing ContentPolicyConfig (should FAIL TC2)"
+Resources:
+  # TC02 - ContentPolicyConfig is missing
+  NC02GuardrailHate: 
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC02MissingContentPolicyHate
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      TopicPolicyConfig:
+        TopicsConfig:
+          - Definition: "Test Topic Definition"
+            Name: "TestTopic"
+            Type: "DENY"
+  NC03NoHateFilter:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC03NoHateFilter
+      Description: "Guardrail missing HATE filter (should FAIL TC3)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: SEXUAL
+            InputStrength: HIGH
+            OutputStrength: HIGH
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+  NC04HateFilterInputStrengthLow:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC04HateFilterInputStrengthLow
+      Description: "Guardrail Input Strength LOW (should FAIL TC4)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: LOW
+            OutputStrength: HIGH
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+  NC05HateFilterOutputStrengthMedium:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC05HateFilterOutputStrengthMedium
+      Description: "Guardrail Output Strength MEDIUM (should FAIL TC5)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: MEDIUM
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+  NC06HateFilterInputActionNone:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC06HateFilterInputActionNone
+      Description: "Guardrail Input Action NONE (should FAIL TC6)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+            InputAction: NONE
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+  NC07HateFilterOutputActionNone:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC07HateFilterOutputActionNone
+      Description: "Guardrail Output Action NONE (should FAIL TC7)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: HATE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+            InputAction: BLOCK
+            OutputAction: NONE
+            InputEnabled: true
+            OutputEnabled: true
+  NC15HateMultipleFilters:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: NC15HateMultipleFilters
+      Description: "Guardrail with multiple HATE filters (should FAIL TC15)"
+      BlockedInputMessaging: "Blocked"
+      BlockedOutputsMessaging: "Blocked"
+      ContentPolicyConfig:
+        FiltersConfig:
+          - Type: VIOLENCE
+            InputStrength: HIGH
+            OutputStrength: HIGH
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: HATE
+            InputStrength: MEDIUM
+            OutputStrength: MEDIUM
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+          - Type: INSULTS
+            InputStrength: HIGH
+            OutputStrength: HIGH
+            InputAction: BLOCK
+            OutputAction: BLOCK
+            InputEnabled: true
+            OutputEnabled: true
+
+Outputs:
+  NC02GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 02
+    Value: !Ref NC02GuardrailHate
+  NC03GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 03
+    Value: !Ref NC03NoHateFilter
+  NC04GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 04
+    Value: !Ref NC04HateFilterInputStrengthLow
+  NC05GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 05
+    Value: !Ref NC05HateFilterOutputStrengthMedium
+  NC06GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 06
+    Value: !Ref NC06HateFilterInputActionNone
+  NC07GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 07
+    Value: !Ref NC07HateFilterOutputActionNone
+  NC15GuardrailArn:
+    Description: Guardrail logical name for non-compliant test case 15
+    Value: !Ref NC15HateMultipleFilters
