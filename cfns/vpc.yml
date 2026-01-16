@@ -1,12 +1,48 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Create a VPC with Subnets, Internet Gateway and Security Groups
+Description: Create a VPC with Subnets, Internet Gateway and Security Groups - WAFR Remediated
 Mappings:
   AMIMap:
     us-east-1:
       AMI: ami-0aa7d40eeae50c9a9
     us-east-2:
       AMI: ami-05bfbece1ed5beb54
+Parameters:
+  # WAFR SEC 5: Add parameter for trusted IP ranges
+  TrustedCIDR:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: CIDR block for trusted network access
+    AllowedPattern: ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$
 Resources:
+  # WAFR SEC 8: Add KMS Key for encryption
+  VPCKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for VPC Lambda function encryption
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow Lambda service
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+            Resource: "*"
+  
+  VPCKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/vpc-lambda-encryption
+      TargetKeyId: !Ref VPCKMSKey
+      
   DefaultVPCNCRole:
     Type: AWS::IAM::Role
     Properties:
@@ -21,19 +57,30 @@ Resources:
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: root
+        - PolicyName: VPCLambdaMinimalPolicy  # WAFR SEC 3: Renamed for clarity
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # WAFR SEC 3: Least privilege - specific EC2 actions only
               - Effect: Allow
                 Action:
-                  - ec2:*
-                  - logs:CreateLogStream
-                  - logs:DescribeLogGroups
-                  - logs:PutMetricData
-                  - logs:CreateLogGroup
-                  - logs:PutLogEvents
+                  - "ec2:DescribeVpcs"
+                  - "ec2:DescribeSubnets"
                 Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:DescribeLogGroups"
+                  - "logs:CreateLogGroup"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/DefaultVPCNC*"
+              # WAFR SEC 8: KMS permissions for encryption
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt VPCKMSKey.Arn
+  
   DefaultVPCNCLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -41,8 +88,14 @@ Resources:
       Handler: index.handler
       Timeout: 600
       Runtime: python3.12
+      # WAFR SEC 4: Enable active tracing for monitoring
       TracingConfig:
-        Mode: PassThrough
+        Mode: Active
+      # WAFR SEC 8: Add KMS encryption for environment variables
+      KmsKeyArn: !GetAtt VPCKMSKey.Arn
+      # WAFR REL 6: Add dead letter queue configuration
+      DeadLetterConfig:
+        TargetArn: !GetAtt DefaultVPCDLQ.Arn
       Code:
         ZipFile: !Sub |
           import json
@@ -69,6 +122,32 @@ Resources:
                   responseData = {}
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
                   return responseData
+  
+  # WAFR REL 6: Add SQS Dead Letter Queue for Lambda error handling
+  DefaultVPCDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: DefaultVPCLambda-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref VPCKMSKey
+  
+  # WAFR REL 6: Add CloudWatch Alarms for monitoring
+  DefaultVPCLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DefaultVPCLambda-Errors
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DefaultVPCNCLambda
+          
   DefaultVPCCR:
     Type: Custom::DefaultVPCCR
     Properties:
@@ -109,7 +188,7 @@ Resources:
       Tags:
         - Key: MC_KEY
           Value: WARNCSUBNET2
-  SubnetC:
+  SubnetB:
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 198.16.3.0/24
@@ -158,32 +237,61 @@ Resources:
     Properties:
       SubnetId: !Ref SubnetB
       RouteTableId: !Ref RouteTable
+      
+  # WAFR SEC 5: CRITICAL FIX - Replace overly permissive security group
   SecurityGroup1:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow all traffic to the internet
+      GroupDescription: Secure access with restricted ingress rules - WAFR Compliant
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - IpProtocol: "-1"
-          FromPort: 0
-          ToPort: 65535
+        # WAFR SEC 5: Replace "-1" (all protocols) with specific HTTP/HTTPS rules
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref TrustedCIDR  # WAFR SEC 5: Use parameter instead of 0.0.0.0/0
+          Description: HTTP access from trusted networks
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref TrustedCIDR  # WAFR SEC 5: Use parameter instead of 0.0.0.0/0
+          Description: HTTPS access from trusted networks
+      SecurityGroupEgress:
+        # WAFR SEC 5: Add explicit egress rules
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
           CidrIp: 0.0.0.0/0
+          Description: HTTP outbound
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound
       Tags:
         - Key: MC_KEY
           Value: WARNCSG1
+        - Key: WAFR-Compliant
+          Value: "true"
+          
+  # WAFR SEC 5: Improved Security Group 2 with proper restrictions
   SecurityGroup2:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow all traffic to the internet
+      GroupDescription: Administrative access with WAFR compliance
       SecurityGroupIngress:
-        - IpProtocol: "-1"
-          FromPort: 0
+        # WAFR SEC 5: SSH access restricted to trusted networks
+        - IpProtocol: tcp
+          FromPort: 22
           ToPort: 22
-          CidrIp: 0.0.0.0/0
+          CidrIp: !Ref TrustedCIDR  # WAFR SEC 5: Remove 0.0.0.0/0
+          Description: SSH access from trusted networks only
+        # WAFR SEC 5: RDP access restricted to trusted networks  
         - IpProtocol: tcp
           FromPort: 3389
           ToPort: 3389
-          CidrIp: 0.0.0.0/0
+          CidrIp: !Ref TrustedCIDR  # WAFR SEC 5: Remove 0.0.0.0/0
+          Description: RDP access from trusted networks only
       SecurityGroupEgress:
         - IpProtocol: "-1"
           FromPort: 0
@@ -193,6 +301,9 @@ Resources:
       Tags:
         - Key: MC_KEY
           Value: WARNCSG2
+        - Key: WAFR-Compliant
+          Value: "true"
+          
   # The below Lambda function delete the security groups created as part of the cluster.
   MyLambdaExecutionRole:
     Type: AWS::IAM::Role
