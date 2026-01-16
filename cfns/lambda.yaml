@@ -1,6 +1,46 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Creates Non-Compliant Lambda Resources 
+Description: Creates WAFR-Compliant Lambda Resources with Security Best Practices
+Parameters:
+  # WAFR SEC 3: Add parameter for trusted AWS accounts
+  TrustedAccountId:
+    Type: String
+    Description: AWS Account ID allowed to invoke Lambda functions
+    Default: !Ref AWS::AccountId
+    AllowedPattern: ^[0-9]{12}$
+    
 Resources:
+  # WAFR SEC 8: KMS Key for Lambda encryption
+  LambdaKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for Lambda function encryption
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow Lambda service
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+              - "kms:Encrypt"
+              - "kms:GenerateDataKey"
+            Resource: "*"
+            
+  LambdaKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/lambda-encryption
+      TargetKeyId: !Ref LambdaKMSKey
+      
+  # WAFR SEC 3: CRITICAL FIX - Replace overly permissive IAM role
   FailingLambdaExecRole:
     Type: AWS::IAM::Role
     Properties:
@@ -15,10 +55,23 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  LambdaAdminRole:
+      # WAFR SEC 3: Add minimal required policies only
+      Policies:
+        - PolicyName: LambdaKMSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt LambdaKMSKey.Arn
+                
+  # WAFR SEC 3: CRITICAL FIX - Replace admin role with least privilege
+  LambdaMinimalRole:
     Type: "AWS::IAM::Role"
     Properties: 
-      RoleName: !Join ["-", [NCLambda-adminRole, !Ref AWS::Region]]
+      RoleName: !Join ["-", [NCLambda-MinimalRole, !Ref AWS::Region]]
       AssumeRolePolicyDocument: 
         Version: "2012-10-17"
         Statement: 
@@ -28,34 +81,69 @@ Resources:
                 - "lambda.amazonaws.com"
             Action: 
               - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # WAFR SEC 3: Least privilege - specific actions only, no wildcard permissions
       Policies: 
-        - PolicyName: "LambdaadminPolicy"
+        - PolicyName: "LambdaSpecificPolicy"
           PolicyDocument: 
             Version: "2012-10-17"
             Statement: 
               - Effect: "Allow"
-                Action: "*"
-                Resource: "*"
+                Action: 
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream" 
+                  - "logs:PutLogEvents"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+              - Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt LambdaKMSKey.Arn
   
+  # WAFR REL 6: Add SQS Dead Letter Queue for error handling
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: Lambda-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref LambdaKMSKey
+      
+  # WAFR PERF 4: MEDIUM FIX - Increase timeout from 1 second to reasonable value
   TimeoutLambda:
     Type: AWS::Lambda::Function
     Properties:
-      Timeout: 1 
+      Timeout: 30  # WAFR PERF 4: Increased from 1 to 30 seconds
       FunctionName:
         !Join [
           "-",
           ["nc-lambda-func-to", !Select [2, !Split ["/", !Ref AWS::StackId]]],
         ]
       Handler: "index.handler"
-      Role: !GetAtt LambdaAdminRole.Arn
+      Role: !GetAtt LambdaMinimalRole.Arn  # WAFR SEC 3: Use least privilege role
       Runtime: python3.11
+      # WAFR SEC 8: Add KMS encryption
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR REL 6: Add dead letter queue configuration
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      # WAFR SEC 4: Enable tracing for monitoring
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           import time
+          import json
           def handler(event, context):
-            i = 2
-            while i > 1:
-              print("I am sleeping, DND") 
+            # WAFR PERF 4: Fixed infinite loop - now processes for max 25 seconds
+            start_time = time.time()
+            while time.time() - start_time < 25:  # Process for 25 seconds max
+              print("Processing work, will complete soon") 
+              time.sleep(1)
+            return {
+              'statusCode': 200,
+              'body': json.dumps('Processing completed successfully')
+            }
 
   FailingLambda:
     Type: AWS::Lambda::Function
@@ -71,15 +159,37 @@ Resources:
       Handler: "index.handler"
       Role: !GetAtt FailingLambdaExecRole.Arn
       Runtime: python3.11
+      # WAFR SEC 8: Add KMS encryption
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR REL 6: Add dead letter queue configuration
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      # WAFR SEC 4: Enable tracing for monitoring
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
+          import json
           def handler(event, context):
-            
-              result = 1 / 0 
-              return {
-                  'statusCode': 200,
-                  'body': 'Function executed successfully'
-              }
+              # WAFR REL 6: Add proper error handling instead of division by zero
+              try:
+                  # Simulate some processing
+                  result = event.get('value', 42) * 2
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Function executed successfully',
+                          'result': result
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Function execution failed',
+                          'details': str(e)
+                      })
+                  }
 
   FailingLambdatriggerRule:
       Type: AWS::Events::Rule
@@ -106,26 +216,6 @@ Resources:
       FunctionName: !GetAtt TimeoutLambda.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt FailingLambdatriggerRule.Arn
-  
-  # ExecutionRole:
-  #   Type: AWS::IAM::Role
-  #   Properties:
-  #     AssumeRolePolicyDocument:
-  #       Version: 2012-10-17
-  #       Statement:
-  #         - Action:
-  #             - "sts:AssumeRole"
-  #           Effect: Allow
-  #           Principal:
-  #             "AWS": "*"
-  #     Policies:
-  #       - PolicyName: "LambdaExecution"
-  #         PolicyDocument:
-  #           Version: "2012-10-17"
-  #           Statement:
-  #             - Action: "*"
-  #               Effect: Allow
-  #               Resource: "*"
                 
   HelloWorldFunction2:
     Type: AWS::Lambda::Function
@@ -134,24 +224,96 @@ Resources:
       Handler: "index.handler"
       Role: !GetAtt FailingLambdaExecRole.Arn
       Runtime: python3.11
+      # WAFR SEC 8: Add KMS encryption
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR REL 6: Add dead letter queue configuration
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      # WAFR SEC 4: Enable tracing for monitoring
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
+          import json
           def handler(event, context):
-              return "Hello, World! (Function 2)"
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello, World! (Function 2)')
+              }
+              
+  # WAFR SEC 3: CRITICAL FIX - Replace wildcard principal with specific account
   LambdaPermission:
     Type: "AWS::Lambda::Permission"
     Properties:
       FunctionName: !Ref HelloWorldFunction2
       Action: "lambda:InvokeFunction"
-      Principal: "*"
+      Principal: !Sub "arn:aws:iam::${TrustedAccountId}:root"  # WAFR SEC 3: Specific account instead of "*"
+      
+  # WAFR REL 6: Add CloudWatch Alarms for monitoring Lambda functions
+  FailingLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${FailingLambda}-Errors"
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FailingLambda
+          
+  TimeoutLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${TimeoutLambda}-Errors"
+      AlarmDescription: Monitor Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TimeoutLambda
+          
+  TimeoutLambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${TimeoutLambda}-Duration"
+      AlarmDescription: Monitor Lambda function duration
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 25000  # 25 seconds in milliseconds
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TimeoutLambda
 
 Outputs:
   FailingLambdaExecRole:
     Value: !GetAtt FailingLambdaExecRole.Arn
+    Description: WAFR-compliant Lambda execution role with least privilege
   FailingLambdaArn:
     Value: !GetAtt FailingLambda.Arn
+    Description: Lambda function with proper error handling and encryption
   HelloWorldFunction2Arn:
     Value: !GetAtt HelloWorldFunction2.Arn
+    Description: Lambda function with WAFR security controls
   TimeoutLambdaArn:
     Value: !GetAtt [TimeoutLambda, Arn]
-  
+    Description: Lambda function with proper timeout and monitoring
+  LambdaKMSKeyArn:
+    Value: !GetAtt LambdaKMSKey.Arn
+    Description: KMS key used for Lambda function encryption
+  LambdaDLQArn:
+    Value: !GetAtt LambdaDLQ.Arn
+    Description: Dead letter queue for Lambda error handling
