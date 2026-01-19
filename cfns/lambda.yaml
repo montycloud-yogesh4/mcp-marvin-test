@@ -1,10 +1,32 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Creates Non-Compliant Lambda Resources 
+Description: Creates WAFR Compliant Lambda Resources
+Parameters:
+  # WAFR COST 02: Environment-based resource sizing
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment for resource sizing
+    
+Mappings:
+  EnvironmentMap:
+    dev:
+      LambdaTimeout: 30
+      LambdaMemory: 128
+    test:
+      LambdaTimeout: 60
+      LambdaMemory: 256
+    prod:
+      LambdaTimeout: 300
+      LambdaMemory: 512
+      
 Resources:
+  # WAFR SEC 03: Least privilege IAM role (replaces lines 29-40)
+  # AWS Documentation: https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html
   FailingLambdaExecRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Join ["-", [NCLambda-ExecutionRole, !Ref AWS::Region]]
+      RoleName: !Join ["-", [WAFRCompliant-LambdaExecutionRole, !Ref AWS::Region]]
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -13,12 +35,20 @@ Resources:
               Service:
                 - lambda.amazonaws.com
             Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  LambdaAdminRole:
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "SEC-03-IAM-LeastPrivilege"
+          
+  # WAFR SEC 03: Specific scoped role instead of admin access
+  LambdaRestrictedRole:
     Type: "AWS::IAM::Role"
     Properties: 
-      RoleName: !Join ["-", [NCLambda-adminRole, !Ref AWS::Region]]
+      RoleName: !Join ["-", [WAFRCompliant-LambdaRestrictedRole, !Ref AWS::Region]]
       AssumeRolePolicyDocument: 
         Version: "2012-10-17"
         Statement: 
@@ -28,68 +58,207 @@ Resources:
                 - "lambda.amazonaws.com"
             Action: 
               - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref "AWS::AccountId"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies: 
-        - PolicyName: "LambdaadminPolicy"
+        - PolicyName: "LambdaSpecificPolicy"
           PolicyDocument: 
             Version: "2012-10-17"
             Statement: 
+              # Only allow CloudWatch metrics
               - Effect: "Allow"
-                Action: "*"
+                Action:
+                  - "cloudwatch:PutMetricData"
                 Resource: "*"
+                Condition:
+                  StringEquals:
+                    "cloudwatch:namespace": "AWS/Lambda"
+              # Only allow SNS publish to specific topics
+              - Effect: "Allow"
+                Action:
+                  - "sns:Publish"
+                Resource: 
+                  - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*"
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "SEC-03-Specific-Permissions"
   
+  # WAFR REL 08: Enhanced error handling and monitoring
   TimeoutLambda:
     Type: AWS::Lambda::Function
     Properties:
-      Timeout: 1 
+      Timeout: !FindInMap [EnvironmentMap, !Ref Environment, LambdaTimeout]
+      MemorySize: !FindInMap [EnvironmentMap, !Ref Environment, LambdaMemory]
       FunctionName:
         !Join [
           "-",
-          ["nc-lambda-func-to", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+          ["wafr-compliant-timeout-func", !Select [2, !Split ["/", !Ref AWS::StackId]]],
         ]
       Handler: "index.handler"
-      Role: !GetAtt LambdaAdminRole.Arn
+      Role: !GetAtt LambdaRestrictedRole.Arn
       Runtime: python3.11
+      # WAFR REL 08: Proper error handling
       Code:
         ZipFile: |
+          import json
           import time
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
           def handler(event, context):
-            i = 2
-            while i > 1:
-              print("I am sleeping, DND") 
+              try:
+                  logger.info("Processing request with proper timeout handling")
+                  
+                  # Check remaining time to prevent timeout
+                  remaining_time = context.get_remaining_time_in_millis()
+                  if remaining_time < 5000:  # 5 seconds buffer
+                      raise Exception("Insufficient time remaining")
+                  
+                  # Controlled processing loop
+                  max_iterations = 10
+                  for i in range(max_iterations):
+                      time.sleep(0.1)  # Controlled delay
+                      logger.info(f"Processing iteration {i}")
+                      
+                      # Check time again
+                      remaining_time = context.get_remaining_time_in_millis()
+                      if remaining_time < 2000:  # 2 seconds buffer
+                          logger.warning("Breaking loop due to time constraint")
+                          break
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Function completed successfully',
+                          'iterations_processed': i + 1
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Function failed: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Function execution failed',
+                          'message': str(e)
+                      })
+                  }
+      # WAFR PERF 04: Environment variables for configuration
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref Environment
+      # WAFR REL 08: Dead letter queue for failed executions
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "REL-08-Error-Handling"
 
+  # WAFR REL 08: Dead Letter Queue for error handling
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-lambda-dlq"
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "REL-08-DLQ"
+
+  # WAFR REL 08: Improved error handling
   FailingLambda:
     Type: AWS::Lambda::Function
     Properties:
       Environment:
         Variables:
-          test_variable: "value"
+          LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref Environment
       FunctionName:
         !Join [
           "-",
-          ["nc-lambda-func", !Select [2, !Split ["/", !Ref AWS::StackId]]],
+          ["wafr-compliant-demo-func", !Select [2, !Split ["/", !Ref AWS::StackId]]],
         ]
       Handler: "index.handler"
       Role: !GetAtt FailingLambdaExecRole.Arn
       Runtime: python3.11
+      Timeout: !FindInMap [EnvironmentMap, !Ref Environment, LambdaTimeout]
+      MemorySize: !FindInMap [EnvironmentMap, !Ref Environment, LambdaMemory]
+      # WAFR REL 08: Proper error handling instead of division by zero
       Code:
         ZipFile: |
+          import json
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
           def handler(event, context):
-            
-              result = 1 / 0 
-              return {
-                  'statusCode': 200,
-                  'body': 'Function executed successfully'
-              }
+              try:
+                  logger.info("Starting function execution")
+                  
+                  # Validate input
+                  if 'test_mode' in event and event['test_mode'] == 'error':
+                      logger.warning("Test error mode activated")
+                      raise ValueError("Simulated error for testing")
+                  
+                  # Safe operation instead of division by zero
+                  result = {
+                      'message': 'Function executed successfully',
+                      'timestamp': context.aws_request_id,
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  }
+                  
+                  logger.info("Function completed successfully")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(result)
+                  }
+              except Exception as e:
+                  logger.error(f"Function error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Function execution failed',
+                          'message': str(e)
+                      })
+                  }
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "REL-08-Resilient-Design"
 
+  # WAFR COST 02: Rate-based scheduling instead of fixed 2-minute intervals
   FailingLambdatriggerRule:
       Type: AWS::Events::Rule
       Properties:
-        Description: Scheduled rule to trigger the Lambda function
-        ScheduleExpression: rate(2 minutes)  
-        State: ENABLED
+        Description: WAFR Compliant scheduled rule with environment-based frequency
+        ScheduleExpression: !Sub 
+          - "rate(${Frequency} minutes)"
+          - Frequency: !If [IsProd, 5, 10]  # Less frequent in non-prod
+        State: !If [IsProd, "ENABLED", "DISABLED"]  # Disabled in non-prod by default
         Targets:
           - Arn: !GetAtt FailingLambda.Arn
-            Id: MyLambdaTarget
+            Id: WAFRCompliantLambdaTarget
+            RetryPolicy:
+              MaximumRetryAttempts: 3
+              MaximumEventAge: 3600  # 1 hour
+        Tags:
+          - Key: "WAFR-Compliance"
+            Value: "COST-02-Environment-Aware"
+
+  # WAFR COST 02: Condition for production environment
+  IsProd:
+    Type: "AWS::NoValue"
+    Condition: !Equals [!Ref Environment, "prod"]
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, "prod"]
 
   TriggerEventPermission1:
     Type: AWS::Lambda::Permission
@@ -106,52 +275,96 @@ Resources:
       FunctionName: !GetAtt TimeoutLambda.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt FailingLambdatriggerRule.Arn
-  
-  # ExecutionRole:
-  #   Type: AWS::IAM::Role
-  #   Properties:
-  #     AssumeRolePolicyDocument:
-  #       Version: 2012-10-17
-  #       Statement:
-  #         - Action:
-  #             - "sts:AssumeRole"
-  #           Effect: Allow
-  #           Principal:
-  #             "AWS": "*"
-  #     Policies:
-  #       - PolicyName: "LambdaExecution"
-  #         PolicyDocument:
-  #           Version: "2012-10-17"
-  #           Statement:
-  #             - Action: "*"
-  #               Effect: Allow
-  #               Resource: "*"
                 
   HelloWorldFunction2:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: "HelloWorldFunction2"
+      FunctionName: "WAFRCompliant-HelloWorldFunction"
       Handler: "index.handler"
       Role: !GetAtt FailingLambdaExecRole.Arn
       Runtime: python3.11
+      Timeout: !FindInMap [EnvironmentMap, !Ref Environment, LambdaTimeout]
+      MemorySize: !FindInMap [EnvironmentMap, !Ref Environment, LambdaMemory]
       Code:
         ZipFile: |
+          import json
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
           def handler(event, context):
-              return "Hello, World! (Function 2)"
+              logger.info("Hello World function executed")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Hello, World! (WAFR Compliant)',
+                      'function': 'HelloWorldFunction2',
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                  })
+              }
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "SEC-03-Compliant-Function"
+          
+  # WAFR SEC 03: Restricted Lambda permission (replaces lines 130-133)
+  # AWS Documentation: https://docs.aws.amazon.com/lambda/latest/dg/access-control-resource-based.html
   LambdaPermission:
     Type: "AWS::Lambda::Permission"
     Properties:
       FunctionName: !Ref HelloWorldFunction2
       Action: "lambda:InvokeFunction"
-      Principal: "*"
+      # Restrict to specific AWS account instead of wildcard
+      Principal: !Ref "AWS::AccountId"
+      # Add source ARN condition for additional security
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  # WAFR OPS 07: CloudWatch Alarms for monitoring
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-Lambda-Errors"
+      AlarmDescription: "Monitor Lambda function errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FailingLambda
+      Tags:
+        - Key: "WAFR-Compliance"
+          Value: "OPS-07-Monitoring"
 
 Outputs:
-  FailingLambdaExecRole:
+  FailingLambdaExecRoleArn:
+    Description: WAFR Compliant Lambda Execution Role ARN
     Value: !GetAtt FailingLambdaExecRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaExecRole"
   FailingLambdaArn:
+    Description: WAFR Compliant Lambda Function ARN
     Value: !GetAtt FailingLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
   HelloWorldFunction2Arn:
+    Description: WAFR Compliant Hello World Function ARN
     Value: !GetAtt HelloWorldFunction2.Arn
   TimeoutLambdaArn:
-    Value: !GetAtt [TimeoutLambda, Arn]
-  
+    Description: WAFR Compliant Timeout Function ARN
+    Value: !GetAtt TimeoutLambda.Arn
+  DeadLetterQueueArn:
+    Description: Dead Letter Queue for failed executions
+    Value: !GetAtt LambdaDLQ.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DLQ"
+  WAFRComplianceStatus:
+    Description: WAFR Compliance Implementation Status
+    Value: "SEC-03,REL-08,COST-02,OPS-07,PERF-04 - Implemented"
