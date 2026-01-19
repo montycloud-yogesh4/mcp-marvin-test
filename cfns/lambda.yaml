@@ -1,157 +1,481 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Creates Non-Compliant Lambda Resources 
+Description: WAFR Compliant Lambda Resources with enhanced security and reliability
+
+Parameters:
+  Environment:
+    Description: Environment name
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+  
+  NotificationEmail:
+    Description: Email address for Lambda error notifications
+    Type: String
+    Default: admin@example.com
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
 Resources:
-  FailingLambdaExecRole:
+  # WAFR SEC-08: KMS Key for Lambda encryption
+  LambdaKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for Lambda function encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'lambda.${AWS::Region}.amazonaws.com'
+
+  LambdaKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-lambda-key'
+      TargetKeyId: !Ref LambdaKMSKey
+
+  # WAFR SEC-03: Least privilege IAM role for basic Lambda
+  SecureLambdaExecRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Join ["-", [NCLambda-ExecutionRole, !Ref AWS::Region]]
+      RoleName: !Sub '${AWS::StackName}-secure-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - lambda.amazonaws.com
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-  LambdaAdminRole:
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      # WAFR SEC-03: Specific permissions instead of wildcard
+      Policies:
+        - PolicyName: LambdaSpecificPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: 
+                  - !GetAtt FailingLambdaDLQ.Arn
+                  - !GetAtt TimeoutLambdaDLQ.Arn
+
+  # WAFR SEC-03: Monitoring-specific IAM role (no admin permissions)
+  MonitoringLambdaRole:
     Type: "AWS::IAM::Role"
     Properties: 
-      RoleName: !Join ["-", [NCLambda-adminRole, !Ref AWS::Region]]
+      RoleName: !Sub '${AWS::StackName}-monitoring-role'
       AssumeRolePolicyDocument: 
         Version: "2012-10-17"
         Statement: 
           - Effect: "Allow"
             Principal: 
-              Service: 
-                - "lambda.amazonaws.com"
-            Action: 
-              - "sts:AssumeRole"
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
       Policies: 
-        - PolicyName: "LambdaadminPolicy"
+        - PolicyName: "LambdaMonitoringPolicy"
           PolicyDocument: 
             Version: "2012-10-17"
             Statement: 
               - Effect: "Allow"
-                Action: "*"
-                Resource: "*"
-  
-  TimeoutLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      Timeout: 1 
-      FunctionName:
-        !Join [
-          "-",
-          ["nc-lambda-func-to", !Select [2, !Split ["/", !Ref AWS::StackId]]],
-        ]
-      Handler: "index.handler"
-      Role: !GetAtt LambdaAdminRole.Arn
-      Runtime: python3.11
-      Code:
-        ZipFile: |
-          import time
-          def handler(event, context):
-            i = 2
-            while i > 1:
-              print("I am sleeping, DND") 
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+                  - !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:metric/*/*'
 
-  FailingLambda:
+  # WAFR REL-07: Dead Letter Queues for failed Lambda invocations
+  FailingLambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-failing-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      # WAFR SEC-08: Enable encryption
+      KmsMasterKeyId: !Ref LambdaKMSKey
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Purpose
+          Value: DeadLetterQueue
+        - Key: Function
+          Value: FailingLambda
+
+  TimeoutLambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-timeout-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref LambdaKMSKey
+      VisibilityTimeoutSeconds: 60
+      Tags:
+        - Key: Purpose
+          Value: DeadLetterQueue
+        - Key: Function
+          Value: TimeoutLambda
+
+  # WAFR OPS-08: SNS Topic for Lambda error notifications
+  LambdaErrorTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-lambda-errors'
+      # WAFR SEC-08: Enable encryption
+      KmsMasterKeyId: !Ref LambdaKMSKey
+
+  LambdaErrorTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref LambdaErrorTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # WAFR Compliant Lambda Function (Fixed timeout)
+  SecureTimeoutLambda:
     Type: AWS::Lambda::Function
     Properties:
+      Timeout: 300  # Increased from 1 second
+      FunctionName: !Sub '${AWS::StackName}-secure-timeout-function'
+      Handler: "index.handler"
+      Role: !GetAtt MonitoringLambdaRole.Arn
+      Runtime: python3.12
+      # WAFR REL-07: Configure Dead Letter Queue
+      DeadLetterConfig:
+        TargetArn: !GetAtt TimeoutLambdaDLQ.Arn
+      # WAFR SEC-08: Enable encryption at rest and in transit
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
+      # WAFR OPS-08: Environment variables for configuration
       Environment:
         Variables:
-          test_variable: "value"
-      FunctionName:
-        !Join [
-          "-",
-          ["nc-lambda-func", !Select [2, !Split ["/", !Ref AWS::StackId]]],
-        ]
-      Handler: "index.handler"
-      Role: !GetAtt FailingLambdaExecRole.Arn
-      Runtime: python3.11
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !Ref LambdaErrorTopic
+      # WAFR REL-05: Reserved concurrency to prevent resource exhaustion
+      ReservedConcurrencyLimit: 10
       Code:
         ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          
           def handler(event, context):
-            
-              result = 1 / 0 
-              return {
-                  'statusCode': 200,
-                  'body': 'Function executed successfully'
-              }
+              sns = boto3.client('sns')
+              
+              try:
+                  print(f"Processing event: {json.dumps(event)}")
+                  
+                  # Simulate some work but with proper timeout management
+                  max_iterations = min(50, (context.get_remaining_time_in_millis() // 1000) - 10)
+                  
+                  for i in range(max_iterations):
+                      print(f"Processing iteration {i+1}/{max_iterations}")
+                      time.sleep(0.1)  # Small sleep instead of infinite loop
+                      
+                      # Check remaining time
+                      if context.get_remaining_time_in_millis() < 5000:  # 5 seconds buffer
+                          print("Approaching timeout, gracefully exiting")
+                          break
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully processed {i+1} iterations',
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Lambda function failed: {str(e)}"
+                  print(error_message)
+                  
+                  # Send error notification
+                  try:
+                      sns.publish(
+                          TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                          Subject='Lambda Function Error',
+                          Message=error_message
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send SNS notification: {str(sns_error)}")
+                  
+                  raise e
 
-  FailingLambdatriggerRule:
-      Type: AWS::Events::Rule
-      Properties:
-        Description: Scheduled rule to trigger the Lambda function
-        ScheduleExpression: rate(2 minutes)  
-        State: ENABLED
-        Targets:
-          - Arn: !GetAtt FailingLambda.Arn
-            Id: MyLambdaTarget
-
-  TriggerEventPermission1:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !GetAtt FailingLambda.Arn
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt FailingLambdatriggerRule.Arn
-
-  TriggerEventPermission2:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !GetAtt TimeoutLambda.Arn
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt FailingLambdatriggerRule.Arn
-  
-  # ExecutionRole:
-  #   Type: AWS::IAM::Role
-  #   Properties:
-  #     AssumeRolePolicyDocument:
-  #       Version: 2012-10-17
-  #       Statement:
-  #         - Action:
-  #             - "sts:AssumeRole"
-  #           Effect: Allow
-  #           Principal:
-  #             "AWS": "*"
-  #     Policies:
-  #       - PolicyName: "LambdaExecution"
-  #         PolicyDocument:
-  #           Version: "2012-10-17"
-  #           Statement:
-  #             - Action: "*"
-  #               Effect: Allow
-  #               Resource: "*"
-                
-  HelloWorldFunction2:
+  # WAFR Compliant Lambda Function (Fixed division by zero)
+  SecureFailingLambda:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: "HelloWorldFunction2"
+      FunctionName: !Sub '${AWS::StackName}-secure-function'
       Handler: "index.handler"
-      Role: !GetAtt FailingLambdaExecRole.Arn
-      Runtime: python3.11
+      Role: !GetAtt SecureLambdaExecRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      # WAFR REL-07: Configure Dead Letter Queue
+      DeadLetterConfig:
+        TargetArn: !GetAtt FailingLambdaDLQ.Arn
+      # WAFR SEC-08: Enable encryption
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
+      # WAFR REL-05: Reserved concurrency
+      ReservedConcurrencyLimit: 5
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SNS_TOPIC_ARN: !Ref LambdaErrorTopic
       Code:
         ZipFile: |
+          import json
+          import os
+          import boto3
+          
           def handler(event, context):
-              return "Hello, World! (Function 2)"
-  LambdaPermission:
+              try:
+                  print(f"Processing event: {json.dumps(event)}")
+                  
+                  # WAFR REL-08: Add proper error handling and validation
+                  if 'test_division' in event and event['test_division']:
+                      # Safe division with validation
+                      numerator = event.get('numerator', 10)
+                      denominator = event.get('denominator', 2)
+                      
+                      if denominator == 0:
+                          raise ValueError("Division by zero is not allowed")
+                      
+                      result = numerator / denominator
+                      
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'result': result,
+                              'message': 'Division completed successfully',
+                              'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                          })
+                      }
+                  
+                  # Default successful response
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Function executed successfully',
+                          'environment': os.environ.get('ENVIRONMENT', 'unknown')
+                      })
+                  }
+                  
+              except Exception as e:
+                  error_message = f"Lambda function failed: {str(e)}"
+                  print(error_message)
+                  
+                  # Send error notification
+                  try:
+                      sns = boto3.client('sns')
+                      sns.publish(
+                          TopicArn=os.environ.get('SNS_TOPIC_ARN'),
+                          Subject='Lambda Function Error',
+                          Message=error_message
+                      )
+                  except Exception as sns_error:
+                      print(f"Failed to send SNS notification: {str(sns_error)}")
+                  
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Function execution failed'
+                      })
+                  }
+
+  # WAFR OPS-08: Separate EventBridge rules for better control
+  SecureFailingLambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-secure-failing-lambda-rule'
+      Description: Scheduled rule to trigger the secure failing Lambda function
+      ScheduleExpression: rate(1 hour)  # Reduced frequency
+      State: DISABLED  # Start disabled for safety
+      Targets:
+        - Arn: !GetAtt SecureFailingLambda.Arn
+          Id: SecureFailingLambdaTarget
+          Input: !Sub |
+            {
+              "test_division": true,
+              "numerator": 10,
+              "denominator": 2,
+              "source": "eventbridge-${Environment}"
+            }
+
+  SecureTimeoutLambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-secure-timeout-lambda-rule'
+      Description: Scheduled rule to trigger the secure timeout Lambda function
+      ScheduleExpression: rate(2 hours)  # Reduced frequency
+      State: DISABLED  # Start disabled for safety
+      Targets:
+        - Arn: !GetAtt SecureTimeoutLambda.Arn
+          Id: SecureTimeoutLambdaTarget
+          Input: !Sub |
+            {
+              "source": "eventbridge-${Environment}",
+              "max_processing_time": 60
+            }
+
+  # WAFR SEC-03: Specific Lambda permissions (no wildcard principals)
+  SecureFailingLambdaEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SecureFailingLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecureFailingLambdaTriggerRule.Arn
+
+  SecureTimeoutLambdaEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SecureTimeoutLambda.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecureTimeoutLambdaTriggerRule.Arn
+
+  # WAFR Compliant demonstration function (no wildcard permissions)
+  SecureHelloWorldFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-hello-world-function'
+      Handler: "index.handler"
+      Role: !GetAtt SecureLambdaExecRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      # WAFR SEC-08: Enable encryption
+      KmsKeyArn: !GetAtt LambdaKMSKey.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import os
+          
+          def handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps({
+                      'message': 'Hello, World! (WAFR Compliant Function)',
+                      'environment': os.environ.get('ENVIRONMENT', 'unknown'),
+                      'request_id': context.aws_request_id
+                  })
+              }
+
+  # WAFR SEC-03: Specific API Gateway permission (no wildcard)
+  SecureHelloWorldAPIPermission:
     Type: "AWS::Lambda::Permission"
     Properties:
-      FunctionName: !Ref HelloWorldFunction2
+      FunctionName: !Ref SecureHelloWorldFunction
       Action: "lambda:InvokeFunction"
-      Principal: "*"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*/*"
+
+  # WAFR OPS-08: CloudWatch Alarms for monitoring
+  FailingLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-failing-lambda-errors'
+      AlarmDescription: 'Alarm when failing Lambda function has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecureFailingLambda
+      AlarmActions:
+        - !Ref LambdaErrorTopic
+
+  TimeoutLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-timeout-lambda-errors'
+      AlarmDescription: 'Alarm when timeout Lambda function has errors'
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 250000  # 250 seconds (close to 300s timeout)
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SecureTimeoutLambda
+      AlarmActions:
+        - !Ref LambdaErrorTopic
 
 Outputs:
-  FailingLambdaExecRole:
-    Value: !GetAtt FailingLambdaExecRole.Arn
-  FailingLambdaArn:
-    Value: !GetAtt FailingLambda.Arn
-  HelloWorldFunction2Arn:
-    Value: !GetAtt HelloWorldFunction2.Arn
-  TimeoutLambdaArn:
-    Value: !GetAtt [TimeoutLambda, Arn]
+  SecureLambdaExecRoleArn:
+    Description: Secure Lambda Execution Role ARN
+    Value: !GetAtt SecureLambdaExecRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecureLambdaExecRoleArn'
   
+  SecureFailingLambdaArn:
+    Description: Secure Failing Lambda Function ARN
+    Value: !GetAtt SecureFailingLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecureFailingLambdaArn'
+  
+  SecureHelloWorldFunctionArn:
+    Description: Secure Hello World Lambda Function ARN
+    Value: !GetAtt SecureHelloWorldFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecureHelloWorldFunctionArn'
+  
+  SecureTimeoutLambdaArn:
+    Description: Secure Timeout Lambda Function ARN
+    Value: !GetAtt SecureTimeoutLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SecureTimeoutLambdaArn'
+  
+  LambdaKMSKeyId:
+    Description: Lambda KMS Key ID
+    Value: !Ref LambdaKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaKMSKeyId'
+  
+  LambdaErrorTopicArn:
+    Description: Lambda Error SNS Topic ARN
+    Value: !Ref LambdaErrorTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaErrorTopicArn'

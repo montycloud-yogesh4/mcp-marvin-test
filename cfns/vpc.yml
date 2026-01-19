@@ -1,78 +1,140 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: Create a VPC with Subnets, Internet Gateway and Security Groups
+Description: WAFR Compliant VPC with enhanced security controls and monitoring
+
 Mappings:
   AMIMap:
     us-east-1:
       AMI: ami-0aa7d40eeae50c9a9
     us-east-2:
       AMI: ami-05bfbece1ed5beb54
+
+Parameters:
+  EnableVpcFlowLogs:
+    Description: Enable VPC Flow Logs for network monitoring
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
 Resources:
+  # WAFR SEC-03: Restrict IAM permissions for Lambda functions
   DefaultVPCNCRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${AWS::StackName}-vpc-lambda-role'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
             Principal:
               Service: lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+            Action: sts:AssumeRole
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # WAFR SEC-03: Specific permissions instead of ec2:*
       Policies:
-        - PolicyName: root
+        - PolicyName: VPCReadOnlyPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
                 Action:
-                  - ec2:*
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                Resource: '*'
+              - Effect: Allow
+                Action:
                   - logs:CreateLogStream
-                  - logs:DescribeLogGroups
-                  - logs:PutMetricData
-                  - logs:CreateLogGroup
                   - logs:PutLogEvents
-                Resource: "*"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+
   DefaultVPCNCLambda:
     Type: AWS::Lambda::Function
     Properties:
+      FunctionName: !Sub '${AWS::StackName}-vpc-info-function'
       Role: !Sub ${DefaultVPCNCRole.Arn}
       Handler: index.handler
-      Timeout: 600
+      Timeout: 300  # Reduced from 600
       Runtime: python3.12
+      # WAFR OPS-08: Enable X-Ray tracing
       TracingConfig:
-        Mode: PassThrough
+        Mode: Active
       Code:
         ZipFile: !Sub |
           import json
-          import os
           import boto3
           import cfnresponse
+          
           def handler(event, context):
-              print(event)
-              if event["RequestType"] == "Create":
-                  ec2 = boto3.client('ec2')
-                  default_vpc = ec2.describe_vpcs(Filters=[{'Name':'isDefault', 'Values':['true']}])
-                  print(default_vpc)
-                  defaultvpc=default_vpc["Vpcs"][0]["VpcId"]
-                  print(defaultvpc)
-                  subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [defaultvpc]}])
-                  subnet_ids = [subnet['SubnetId'] for subnet in subnets['Subnets']]
-                  subnet_id=subnet_ids[0]
-                  print(subnet_id)
-                  responseData = {"defaultvpc": defaultvpc,"subnetid": subnet_id}
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
-                  return responseData
-              elif (event["RequestType"] == "Update" or event["RequestType"] == "Delete"):
-                  print("Update or delete Create Logic")
-                  responseData = {}
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
-                  return responseData
+              print(json.dumps(event, default=str))
+              try:
+                  if event["RequestType"] == "Create":
+                      ec2 = boto3.client('ec2')
+                      default_vpc = ec2.describe_vpcs(
+                          Filters=[{'Name':'isDefault', 'Values':['true']}]
+                      )
+                      
+                      if not default_vpc["Vpcs"]:
+                          raise Exception("No default VPC found")
+                          
+                      defaultvpc = default_vpc["Vpcs"][0]["VpcId"]
+                      print(f"Default VPC: {defaultvpc}")
+                      
+                      subnets = ec2.describe_subnets(
+                          Filters=[{'Name': 'vpc-id', 'Values': [defaultvpc]}]
+                      )
+                      
+                      if not subnets['Subnets']:
+                          raise Exception("No subnets found in default VPC")
+                          
+                      subnet_id = subnets['Subnets'][0]['SubnetId']
+                      print(f"Subnet ID: {subnet_id}")
+                      
+                      responseData = {"defaultvpc": defaultvpc, "subnetid": subnet_id}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  else:
+                      responseData = {}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+
   DefaultVPCCR:
     Type: Custom::DefaultVPCCR
     Properties:
       ServiceToken: !Sub ${DefaultVPCNCLambda.Arn}
+
+  # WAFR SEC-08: KMS Key for VPC Flow Logs encryption
+  VPCFlowLogsKMSKey:
+    Type: AWS::KMS::Key
+    Condition: EnableFlowLogs
+    Properties:
+      Description: KMS Key for VPC Flow Logs encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  VPCFlowLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Condition: EnableFlowLogs
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-vpc-flowlogs-key'
+      TargetKeyId: !Ref VPCFlowLogsKMSKey
+
   VPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -81,122 +143,336 @@ Resources:
       EnableDnsSupport: true
       EnableDnsHostnames: true
       Tags:
-        - Key: MC_KEY
-          Value: WARNCVPC1
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: Environment
+          Value: Production
+        - Key: WAFRCompliant
+          Value: 'true'
+
+  # WAFR SEC-04: VPC Flow Logs for network monitoring
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableFlowLogs
+    Properties:
+      LogGroupName: !Sub '/aws/vpc/flowlogs/${AWS::StackName}'
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt VPCFlowLogsKMSKey.Arn
+
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Condition: EnableFlowLogs
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsDeliveryRolePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/vpc/flowlogs/${AWS::StackName}:*'
+
+  VPCFlowLogs:
+    Type: AWS::EC2::FlowLog
+    Condition: EnableFlowLogs
+    Properties:
+      ResourceType: VPC
+      ResourceId: !Ref VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc-flowlogs'
+
   SubnetA:
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 198.16.1.0/24
       VpcId: !Ref VPC
-      AvailabilityZone: !Select
-        - 0
-        - !GetAZs
-          Ref: AWS::Region
-      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs !Ref AWS::Region]
+      # WAFR SEC-05: Disable auto-assign public IP for security
+      MapPublicIpOnLaunch: false
       Tags:
-        - Key: MC_KEY
-          Value: WARNCSUBNET1
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-a'
+        - Key: Type
+          Value: Private
+
   SubnetB:
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 198.16.2.0/24
       VpcId: !Ref VPC
-      AvailabilityZone: !Select
-        - 1
-        - !GetAZs
-          Ref: AWS::Region
+      AvailabilityZone: !Select [1, !GetAZs !Ref AWS::Region]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-b'
+        - Key: Type
+          Value: Private
+
+  # Add public subnets for NAT Gateways
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 198.16.10.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs !Ref AWS::Region]
       MapPublicIpOnLaunch: true
       Tags:
-        - Key: MC_KEY
-          Value: WARNCSUBNET2
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-a'
+        - Key: Type
+          Value: Public
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 198.16.11.0/24
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs !Ref AWS::Region]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-subnet-b'
+        - Key: Type
+          Value: Public
+
   SubnetC:
     Type: AWS::EC2::Subnet
     Properties:
       CidrBlock: 198.16.3.0/24
       VpcId: !Ref VPC
-      AvailabilityZone: !Select
-        - 2
-        - !GetAZs
-          Ref: AWS::Region
-      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [2, !GetAZs !Ref AWS::Region]
+      MapPublicIpOnLaunch: false
       Tags:
-        - Key: MC_KEY
-          Value: WARNCSUBNET3
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-subnet-c'
+        - Key: Type
+          Value: Private
+
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
-        - Key: MC_KEY
-          Value: WARNCIG1
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
   VPCGatewayAttachment:
     Type: "AWS::EC2::VPCGatewayAttachment"
     Properties:
       VpcId: !Ref VPC
       InternetGatewayId: !Ref InternetGateway
-  RouteTable:
+
+  # WAFR REL-05: NAT Gateways for high availability
+  NATGatewayAEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip-a'
+
+  NATGatewayBEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-eip-b'
+
+  NATGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayAEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-a'
+
+  NATGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayBEIP.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nat-b'
+
+  # Route Tables
+  PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref VPC
       Tags:
-        - Key: MC_KEY
-          Value: WARNCROUTE1
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-a'
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt-b'
+
+  # Routes
   InternetRoute:
     Type: "AWS::EC2::Route"
-    DependsOn:
-      - VPCGatewayAttachment
+    DependsOn: VPCGatewayAttachment
     Properties:
       DestinationCidrBlock: 0.0.0.0/0
       GatewayId: !Ref InternetGateway
-      RouteTableId: !Ref RouteTable
+      RouteTableId: !Ref PublicRouteTable
+
+  NATRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayA
+
+  NATRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayB
+
+  # Route Table Associations
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
   SubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref SubnetA
-      RouteTableId: !Ref RouteTable
+      RouteTableId: !Ref PrivateRouteTableA
+
   SubnetBRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       SubnetId: !Ref SubnetB
-      RouteTableId: !Ref RouteTable
-  SecurityGroup1:
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # WAFR SEC-05: Secure Security Groups with specific rules
+  ALBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow all traffic to the internet
+      GroupDescription: "WAFR Compliant ALB Security Group"
       VpcId: !Ref VPC
       SecurityGroupIngress:
-        - IpProtocol: "-1"
-          FromPort: 0
-          ToPort: 65535
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
           CidrIp: 0.0.0.0/0
+          Description: "HTTP from internet"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: 0.0.0.0/0
+          Description: "HTTPS from internet"
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+          Description: "HTTP to web servers"
       Tags:
-        - Key: MC_KEY
-          Value: WARNCSG1
-  SecurityGroup2:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-alb-sg'
+        - Key: Purpose
+          Value: 'Load Balancer'
+
+  WebSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow all traffic to the internet
+      GroupDescription: "WAFR Compliant Web Security Group"
+      VpcId: !Ref VPC
       SecurityGroupIngress:
-        - IpProtocol: "-1"
-          FromPort: 0
-          ToPort: 22
-          CidrIp: 0.0.0.0/0
-        - IpProtocol: tcp
-          FromPort: 3389
-          ToPort: 3389
-          CidrIp: 0.0.0.0/0
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: "HTTP from ALB only"
+      SecurityGroupEgress:
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTP outbound"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS outbound"
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-web-sg'
+        - Key: Purpose
+          Value: 'Web Servers'
+
+  # Management Security Group for SSH access
+  ManagementSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "WAFR Compliant Management Security Group"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # SSH access restricted to VPC CIDR only
+        - IpProtocol: "tcp"
+          FromPort: "22"
+          ToPort: "22"
+          CidrIp: "198.16.0.0/16"
+          Description: "SSH from VPC only"
       SecurityGroupEgress:
         - IpProtocol: "-1"
-          FromPort: 0
-          ToPort: -1
-          CidrIp: 0.0.0.0/0
-      VpcId: !Ref VPC
+          CidrIp: "0.0.0.0/0"
+          Description: "All outbound traffic"
       Tags:
-        - Key: MC_KEY
-          Value: WARNCSG2
-  # The below Lambda function delete the security groups created as part of the cluster.
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-mgmt-sg'
+        - Key: Purpose
+          Value: 'Management Access'
+
+  # WAFR SEC-03: Restricted IAM role for Lambda cleanup function
   MyLambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${AWS::StackName}-cleanup-lambda-role'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -204,8 +480,10 @@ Resources:
             Principal:
               Service: "lambda.amazonaws.com"
             Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: "LambdaEC2Permissions"
+        - PolicyName: "LambdaEC2CleanupPermissions"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -215,15 +493,23 @@ Resources:
                   - "ec2:DescribeSecurityGroups"
                   - "ec2:DeleteSecurityGroup"
                   - "ec2:RevokeSecurityGroupIngress"
-                  - "logs:*"
                 Resource: "*"
+                Condition:
+                  StringEquals:
+                    'ec2:Region': !Ref AWS::Region
 
-  # Lambda Function
   DeleteEMRSecurityGroupsFunction:
     Type: AWS::Lambda::Function
     Properties:
+      FunctionName: !Sub '${AWS::StackName}-cleanup-function'
       Handler: "index.handler"
       Role: !GetAtt MyLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 128
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
           VPC_ID: !Ref VPC
@@ -232,122 +518,143 @@ Resources:
           import os
           import boto3
           import cfnresponse
+          
           def delete_security_groups(ec2_client):
-            # Security group names to delete
-            sg_names_to_delete = ['ElasticMapReduce-slave', 'ElasticMapReduce-master']
-            # Retrieve all VPCs
-            vpc_id = os.environ.get('VPC_ID')
-            # For each VPC, look for each security group name we want to delete
-            for sg_name in sg_names_to_delete:
-              security_groups = ec2_client.describe_security_groups(
-                Filters=[
-                  {'Name': 'group-name', 'Values': [sg_name]},
-                  {'Name': 'vpc-id', 'Values': [vpc_id]}
-                ]
-              )['SecurityGroups']
-              for sg in security_groups:
-                sg_id = sg['GroupId']
-                try:
-                  response = ec2_client.describe_security_groups(GroupIds=[sg_id])
-                  ip_permissions = response['SecurityGroups'][0]['IpPermissions']
-
-                  # Revoke all inbound rules
-                  if ip_permissions:
-                      ec2_client.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=ip_permissions)
-                      print(f"Inbound rules removed for Security Group {sg_id}")
-                  else:
-                      print("No inbound rules to remove.")
-                except Exception as e:
-                  print(f"Could not remove inbound rules {sg_id}")
-            for sg_name in sg_names_to_delete:
-              security_groups = ec2_client.describe_security_groups(
-                Filters=[
-                  {'Name': 'group-name', 'Values': [sg_name]},
-                  {'Name': 'vpc-id', 'Values': [vpc_id]}
-                ]
-              )['SecurityGroups']
-              for sg in security_groups:
-                sg_id = sg['GroupId']
-                try:
-                  ec2_client.delete_security_group(GroupId=sg_id)
-                  print(f"Deleted security group {sg_name} ({sg_id}) in VPC {vpc_id}")
-                except Exception as e:
-                  print(f"Could not delete security group {sg_name} ({sg_id}) in VPC {vpc_id}: {str(e)}")
-
-
+              sg_names_to_delete = ['ElasticMapReduce-slave', 'ElasticMapReduce-master']
+              vpc_id = os.environ.get('VPC_ID')
+              
+              if not vpc_id:
+                  print("No VPC_ID found in environment")
+                  return
+                  
+              for sg_name in sg_names_to_delete:
+                  try:
+                      security_groups = ec2_client.describe_security_groups(
+                          Filters=[
+                              {'Name': 'group-name', 'Values': [sg_name]},
+                              {'Name': 'vpc-id', 'Values': [vpc_id]}
+                          ]
+                      )['SecurityGroups']
+                      
+                      for sg in security_groups:
+                          sg_id = sg['GroupId']
+                          try:
+                              # Revoke inbound rules first
+                              response = ec2_client.describe_security_groups(GroupIds=[sg_id])
+                              ip_permissions = response['SecurityGroups'][0]['IpPermissions']
+                              
+                              if ip_permissions:
+                                  ec2_client.revoke_security_group_ingress(
+                                      GroupId=sg_id, 
+                                      IpPermissions=ip_permissions
+                                  )
+                                  print(f"Inbound rules removed for {sg_id}")
+                                  
+                              # Delete the security group
+                              ec2_client.delete_security_group(GroupId=sg_id)
+                              print(f"Deleted security group {sg_name} ({sg_id})")
+                          except Exception as e:
+                              print(f"Could not process security group {sg_id}: {str(e)}")
+                  except Exception as e:
+                      print(f"Could not find security groups for {sg_name}: {str(e)}")
+          
           def handler(event, context):
-            ec2_client = boto3.client('ec2')          
-            if (event["RequestType"] == "Delete"):
-              delete_security_groups(ec2_client)
-              responseData = {}
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalIDEMRNC")
-              return
-            elif (event["RequestType"] == "Create" or event["RequestType"] == "Update"):
-              responseData = {}
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalIDEMRNC")
-              return
-      Runtime: python3.11
-      Timeout: 300
-      MemorySize: 128
+              try:
+                  ec2_client = boto3.client('ec2')
+                  
+                  if event["RequestType"] == "Delete":
+                      delete_security_groups(ec2_client)
+                  
+                  responseData = {}
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
 
-  # Custom Resource to Trigger the Lambda Function
   DeleteSecurityGroupsCustomResource:
     Type: Custom::DeleteEMRSecurityGroups
     Properties:
       ServiceToken: !GetAtt DeleteEMRSecurityGroupsFunction.Arn
       ServiceTimeout: 300
 
+Conditions:
+  EnableFlowLogs: !Equals [!Ref EnableVpcFlowLogs, 'true']
+
 Outputs:
   AccountIdRegion:
     Description: AccountIdRegion
-    Value: !Join
-      - ""
-      - - !Ref AWS::AccountId
-        - /
-        - !Ref AWS::Region
-  SecurityGroupID1:
-    Description: Security Group -1 ID
-    Value: !Ref SecurityGroup1
+    Value: !Join ["", [!Ref AWS::AccountId, "/", !Ref AWS::Region]]
+  
+  ALBSecurityGroupID:
+    Description: ALB Security Group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupID'
+  
+  WebSecurityGroupID:
+    Description: Web Security Group ID
+    Value: !Ref WebSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSecurityGroupID'
+  
+  ManagementSecurityGroupID:
+    Description: Management Security Group ID
+    Value: !Ref ManagementSecurityGroup
     Export:
       Name: SecurityGroupID1
-  SecurityGroupID2:
-    Description: Security Group -2 ID
-    Value: !Ref SecurityGroup2
-    Export:
-      Name: SecurityGroupID2
+
   VPCID:
     Description: VPC ID
     Value: !Ref VPC
     Export:
       Name: VPCID
+  
   SubnetAID:
-    Description: Subnet A ID
+    Description: Private Subnet A ID
     Value: !Ref SubnetA
     Export:
       Name: SubnetAID
+  
   SubnetBID:
-    Description: Subnet B ID
+    Description: Private Subnet B ID
     Value: !Ref SubnetB
     Export:
       Name: SubnetBID
+  
   SubnetCID:
-    Description: Subnet B ID
+    Description: Private Subnet C ID
     Value: !Ref SubnetC
     Export:
       Name: SubnetCID
+  
+  PublicSubnetAID:
+    Description: Public Subnet A ID
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: PublicSubnetAID
+  
+  PublicSubnetBID:
+    Description: Public Subnet B ID
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: PublicSubnetBID
+  
   InternetGatewayID:
-    Description: Internetgateway ID
+    Description: Internet Gateway ID
     Value: !Ref InternetGateway
     Export:
       Name: InternetGatewayID
-  RouteTableID:
-    Description: RouteTable ID
-    Value: !Ref RouteTable
+  
+  VPCFlowLogsGroupName:
+    Description: VPC Flow Logs CloudWatch Log Group
+    Value: !If [EnableFlowLogs, !Ref VPCFlowLogsGroup, 'Not Enabled']
     Export:
-      Name: RouteTableID
+      Name: VPCFlowLogsGroup
+  
   DefaultVPCId:
-    Description: ID of the Default VPCs
+    Description: ID of the Default VPC
     Value: !GetAtt DefaultVPCCR.defaultvpc
-  SubnetID:
-    Description: Subnet ID
+  
+  DefaultSubnetID:
+    Description: Default Subnet ID
     Value: !GetAtt DefaultVPCCR.subnetid

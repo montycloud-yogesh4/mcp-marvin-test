@@ -1,121 +1,235 @@
 AWSTemplateFormatVersion: 2010-09-09
+Description: WAFR Compliant CloudTrail with enhanced security controls and monitoring
+
+Parameters:
+  RetentionDays:
+    Description: Log retention period in days
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 3653
+  
+  EnableDataEvents:
+    Description: Enable data events logging for S3 and Lambda
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+  
+  NotificationEmail:
+    Description: Email address for CloudTrail notifications
+    Type: String
+    Default: security@example.com
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
 Resources:
-  S3Bucket:
+  # WAFR SEC-08: Secure KMS Key with restricted access
+  SecureCloudTrailKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: WAFR Compliant KMS Key for CloudTrail encryption
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Root account access
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # CloudTrail service permissions
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'cloudtrail.${AWS::Region}.amazonaws.com'
+          # CloudWatch Logs permissions
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'logs.${AWS::Region}.amazonaws.com'
+          # SNS service permissions
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService': !Sub 'sns.${AWS::Region}.amazonaws.com'
+
+  SecureCloudTrailKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-cloudtrail-key'
+      TargetKeyId: !Ref SecureCloudTrailKMSKey
+
+  # WAFR SEC-08: S3 Bucket with advanced security controls
+  SecureS3Bucket:
     Type: AWS::S3::Bucket
     Properties:
-      AccessControl: "BucketOwnerFullControl"
-      BucketName: !Join
-        - "-"
-        - - "wafr-comp-ct-s3"
-          - !Select
-            - 0
-            - !Split
-              - "-"
-              - !Select
-                - 2
-                - !Split
-                  - "/"
-                  - !Ref "AWS::StackId"
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerPreferred
+      BucketName: !Sub '${AWS::StackName}-secure-cloudtrail-${AWS::AccountId}-${AWS::Region}'
+      # WAFR SEC-05: Block all public access
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # WAFR SEC-08: Enable default encryption
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecureCloudTrailKMSKey
+            BucketKeyEnabled: true
+      # WAFR SEC-08: Enable versioning for data protection
+      VersioningConfiguration:
+        Status: Enabled
+      # WAFR OPS-08: Enable access logging
       LoggingConfiguration:
         DestinationBucketName: !Ref LoggingBucket
-        LogFilePrefix: s3-access-logs/
+        LogFilePrefix: cloudtrail-access-logs/
+      # WAFR REL-05: Lifecycle configuration for cost optimization
+      LifecycleConfiguration:
+        Rules:
+          - Id: CloudTrailLogsLifecycle
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            ExpirationInDays: 2557  # 7 years retention
+      # WAFR OPS-08: Notification configuration
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: s3:ObjectCreated:*
+            CloudWatchConfiguration:
+              LogGroupName: !Ref CloudTrailLogGroup
+      Tags:
+        - Key: Purpose
+          Value: CloudTrail
+        - Key: Security
+          Value: High
+        - Key: Compliance
+          Value: WAFR
+
+  # WAFR OPS-08: Separate logging bucket
   LoggingBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName:
-        !Join [
-          "-",
-          [
-            "war-test-logging-bucket",
-            !Select [2, !Split ["/", !Ref AWS::StackId]],
-          ],
-        ]
-  S3BucketPolicy:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecureCloudTrailKMSKey
+      LifecycleConfiguration:
+        Rules:
+          - Id: AccessLogsLifecycle
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Purpose
+          Value: AccessLogs
+        - Key: Security
+          Value: High
+
+  # WAFR SEC-03: Secure S3 bucket policy with least privilege
+  SecureS3BucketPolicy:
     Type: "AWS::S3::BucketPolicy"
     Properties:
-      Bucket: !Ref S3Bucket
+      Bucket: !Ref SecureS3Bucket
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
+          # CloudTrail ACL check
           - Sid: AWSCloudTrailAclCheck
             Effect: Allow
             Principal:
               Service: "cloudtrail.amazonaws.com"
-            Action:
-              - "s3:GetBucketAcl"
-            Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+            Action: "s3:GetBucketAcl"
+            Resource: !Sub "arn:aws:s3:::${SecureS3Bucket}"
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-secure-trail'
+          # CloudTrail write access
           - Sid: AWSCloudTrailWrite
             Effect: Allow
             Principal:
               Service: "cloudtrail.amazonaws.com"
-            Action:
-              - "s3:PutObject"
-            Resource: !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${SecureS3Bucket}/*"
             Condition:
               StringEquals:
-                "s3:x-amz-acl": "bucket-owner-full-control"
-  WartestkmsKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: KMS Key for wartestKinesisStreamNonCompliant
-      KeyPolicy:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              AWS: "*"
-            Action:
-              - "kms:*"
-            Resource: "*"
-  WARTestTrail:
-    DependsOn:
-      - S3BucketPolicy
-    Type: AWS::CloudTrail::Trail
-    Properties:
-      S3BucketName: !Ref S3Bucket
-      EnableLogFileValidation: true
-      KMSKeyId: !GetAtt [WartestkmsKey, Arn]
-      AdvancedEventSelectors:
-        - Name: "Management events selector"
-          FieldSelectors:
-            - Field: "eventCategory"
-              Equals:
-                - "Management"
-      IsLogging: true
-      TrailName: !Join
-        - "-"
-        - - "wafr-comp-ct"
-          - !Select
-            - 0
-            - !Split
-              - "-"
-              - !Select
-                - 2
-                - !Split
-                  - "/"
-                  - !Ref "AWS::StackId"
+                's3:x-amz-acl': 'bucket-owner-full-control'
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::StackName}-secure-trail'
+          # Deny unencrypted uploads
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:aws:s3:::${SecureS3Bucket}/*"
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': 'aws:kms'
+          # Deny public access
+          - Sid: DenyPublicAccess
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${SecureS3Bucket}"
+              - !Sub "arn:aws:s3:::${SecureS3Bucket}/*"
+            Condition:
+              StringEquals:
+                'aws:PrincipalServiceName': []
+              StringNotEquals:
+                'aws:PrincipalAccount': !Ref AWS::AccountId
 
-      IncludeGlobalServiceEvents: true
-      IsMultiRegionTrail: true
-      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
-      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchLogsRole.Arn
-
+  # WAFR OPS-08: Enhanced CloudWatch Log Group
   CloudTrailLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "${AWS::StackName}-cloudtrail-logs"
+      LogGroupName: !Sub '/aws/cloudtrail/${AWS::StackName}'
+      RetentionInDays: !Ref RetentionDays
+      KmsKeyId: !GetAtt SecureCloudTrailKMSKey.Arn
+      Tags:
+        - Key: Purpose
+          Value: CloudTrail
+        - Key: Security
+          Value: High
 
+  # WAFR SEC-03: Restricted IAM role for CloudTrail
   CloudTrailCloudWatchLogsRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${AWS::StackName}-cloudtrail-logs-role'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -128,44 +242,105 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # CloudWatch Logs permissions
               - Effect: Allow
                 Action:
                   - logs:PutLogEvents
                   - logs:CreateLogStream
-                Resource: !GetAtt CloudTrailLogGroup.Arn
+                Resource: !Sub '${CloudTrailLogGroup.Arn}:*'
+              # KMS permissions for encryption
               - Effect: Allow
                 Action:
-                  - s3:GetObject
-                  - s3:ListBucket
                   - kms:Decrypt
-                Resource:
-                  - !Sub arn:aws:s3:::${S3Bucket}/*
-                  - !Sub arn:aws:s3:::${S3Bucket}
-                  - !GetAtt [WartestkmsKey, Arn]
+                  - kms:GenerateDataKey
+                Resource: !GetAtt SecureCloudTrailKMSKey.Arn
+                Condition:
+                  StringEquals:
+                    'kms:ViaService': !Sub 'logs.${AWS::Region}.amazonaws.com'
 
-  # SNS Topic for alarm notifications
-  AlarmTopic:
-    Type: "AWS::SNS::Topic"
-
-  MyLambdaFunction:
-    Type: "AWS::Lambda::Function"
+  # WAFR Compliant CloudTrail
+  SecureCloudTrail:
+    DependsOn: SecureS3BucketPolicy
+    Type: AWS::CloudTrail::Trail
     Properties:
-      Handler: "index.handler"
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Runtime: "nodejs18.x"
-      Code:
-        ZipFile: |
-          exports.handler = async (event) => {
-            console.log("Event: ", JSON.stringify(event, null, 2));
-            return {
-              statusCode: 200,
-              body: JSON.stringify('Hello from Lambda!'),
-            };
-          };
+      TrailName: !Sub '${AWS::StackName}-secure-trail'
+      S3BucketName: !Ref SecureS3Bucket
+      S3KeyPrefix: 'AWSLogs/'
+      # WAFR SEC-08: Enable log file validation
+      EnableLogFileValidation: true
+      # WAFR SEC-08: Enable encryption
+      KMSKeyId: !GetAtt SecureCloudTrailKMSKey.Arn
+      # WAFR SEC-04: Enable comprehensive event selection
+      AdvancedEventSelectors:
+        # Management events
+        - Name: "All Management Events"
+          FieldSelectors:
+            - Field: "eventCategory"
+              Equals: ["Management"]
+        # Data events (conditional)
+        - !If
+          - EnableDataEventsCondition
+          - Name: "S3 Data Events"
+            FieldSelectors:
+              - Field: "eventCategory"
+                Equals: ["Data"]
+              - Field: "resources.type"
+                Equals: ["AWS::S3::Object"]
+          - !Ref AWS::NoValue
+        - !If
+          - EnableDataEventsCondition
+          - Name: "Lambda Data Events"
+            FieldSelectors:
+              - Field: "eventCategory"
+                Equals: ["Data"]
+              - Field: "resources.type"
+                Equals: ["AWS::Lambda::Function"]
+          - !Ref AWS::NoValue
+      # WAFR OPS-05: Enable logging
+      IsLogging: true
+      # WAFR REL-05: Multi-region trail for resilience
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      # WAFR OPS-08: CloudWatch integration
+      CloudWatchLogsLogGroupArn: !Sub '${CloudTrailLogGroup.Arn}:*'
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailCloudWatchLogsRole.Arn
+      # WAFR OPS-08: SNS notifications
+      SNSTopicName: !GetAtt SecureAlarmTopic.TopicName
+      Tags:
+        - Key: Purpose
+          Value: SecurityAuditing
+        - Key: Compliance
+          Value: WAFR
+        - Key: Environment
+          Value: Production
 
-  LambdaExecutionRole:
+  # WAFR SEC-08: Encrypted SNS Topic for security alerts
+  SecureAlarmTopic:
+    Type: "AWS::SNS::Topic"
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-security-alerts'
+      DisplayName: 'CloudTrail Security Alerts'
+      # WAFR SEC-08: Enable encryption
+      KmsMasterKeyId: !Ref SecureCloudTrailKMSKey
+      Tags:
+        - Key: Purpose
+          Value: SecurityAlerts
+        - Key: Security
+          Value: High
+
+  # Email subscription for security alerts
+  SecurityAlertSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      TopicArn: !Ref SecureAlarmTopic
+      Protocol: "email"
+      Endpoint: !Ref NotificationEmail
+
+  # WAFR SEC-03: Secure Lambda execution role
+  SecurityLambdaExecutionRole:
     Type: "AWS::IAM::Role"
     Properties:
+      RoleName: !Sub '${AWS::StackName}-security-lambda-role'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -173,128 +348,341 @@ Resources:
             Principal:
               Service: "lambda.amazonaws.com"
             Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: "LambdaExecutionPolicy"
+        - PolicyName: "SecurityLambdaPolicy"
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # CloudWatch Logs permissions
               - Effect: "Allow"
                 Action:
                   - "logs:CreateLogGroup"
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
-                Resource: "*"
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*'
+              # SNS publish permissions
               - Effect: "Allow"
                 Action: "sns:Publish"
-                Resource: !Ref AlarmTopic
+                Resource: !Ref SecureAlarmTopic
+              # KMS permissions
+              - Effect: "Allow"
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:GenerateDataKey"
+                Resource: !GetAtt SecureCloudTrailKMSKey.Arn
 
-  MySNSSubscription:
+  # WAFR SEC-04: Security monitoring Lambda function
+  SecurityMonitoringLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-security-monitor'
+      Handler: "index.handler"
+      Role: !GetAtt SecurityLambdaExecutionRole.Arn
+      Runtime: "python3.12"
+      Timeout: 60
+      # WAFR SEC-08: Enable encryption
+      KmsKeyArn: !GetAtt SecureCloudTrailKMSKey.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecureAlarmTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import gzip
+          import base64
+          
+          def handler(event, context):
+              sns = boto3.client('sns')
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              try:
+                  # Process CloudWatch Logs data from CloudTrail
+                  if 'awslogs' in event:
+                      compressed_payload = base64.b64decode(event['awslogs']['data'])
+                      uncompressed_payload = gzip.decompress(compressed_payload)
+                      log_data = json.loads(uncompressed_payload)
+                      
+                      # Analyze log events for security concerns
+                      security_events = []
+                      
+                      for log_event in log_data['logEvents']:
+                          message = json.loads(log_event['message'])
+                          
+                          # Check for high-risk events
+                          if message.get('eventName') in [
+                              'DeleteTrail', 'StopLogging', 'PutBucketPolicy',
+                              'DeleteBucket', 'CreateUser', 'DeleteUser',
+                              'AttachUserPolicy', 'DetachUserPolicy'
+                          ]:
+                              security_events.append({
+                                  'eventName': message.get('eventName'),
+                                  'sourceIPAddress': message.get('sourceIPAddress'),
+                                  'userIdentity': message.get('userIdentity', {}),
+                                  'eventTime': message.get('eventTime')
+                              })
+                      
+                      # Send alerts for security events
+                      if security_events:
+                          alert_message = f"Security Alert: {len(security_events)} high-risk events detected\n\n"
+                          for event in security_events[:5]:  # Limit to first 5 events
+                              alert_message += f"Event: {event['eventName']}\n"
+                              alert_message += f"Time: {event['eventTime']}\n"
+                              alert_message += f"Source IP: {event['sourceIPAddress']}\n"
+                              alert_message += f"User: {event['userIdentity'].get('type', 'Unknown')}\n\n"
+                          
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Subject='CloudTrail Security Alert',
+                              Message=alert_message
+                          )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Security monitoring completed')
+                  }
+              
+              except Exception as e:
+                  print(f"Error processing security events: {str(e)}")
+                  
+                  # Send error notification
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject='CloudTrail Security Monitor Error',
+                      Message=f'Error in security monitoring: {str(e)}'
+                  )
+                  
+                  raise e
+
+  # SNS subscription for Lambda
+  SecurityLambdaSNSSubscription:
     Type: "AWS::SNS::Subscription"
     Properties:
-      TopicArn: !Ref AlarmTopic
+      TopicArn: !Ref SecureAlarmTopic
       Protocol: "lambda"
-      Endpoint: !GetAtt MyLambdaFunction.Arn
+      Endpoint: !GetAtt SecurityMonitoringLambdaFunction.Arn
 
-  LambdaInvokePermission:
+  # Lambda permission for SNS
+  SecurityLambdaInvokePermission:
     Type: "AWS::Lambda::Permission"
     Properties:
       Action: "lambda:InvokeFunction"
-      FunctionName: !Ref MyLambdaFunction
+      FunctionName: !Ref SecurityMonitoringLambdaFunction
       Principal: "sns.amazonaws.com"
-      SourceArn: !Ref AlarmTopic
+      SourceArn: !Ref SecureAlarmTopic
 
-  MyLambdaDeleteS3ExecutionRole:
+  # WAFR SEC-03: Secure S3 deletion Lambda role
+  S3DeleteLambdaExecutionRole:
     Type: "AWS::IAM::Role"
     Properties:
-      RoleName: !Join
-        - "-"
-        - - "lambda-execution-role"
-          - !Select
-            - 0
-            - !Split
-              - "-"
-              - !Select
-                - 2
-                - !Split
-                  - "/"
-                  - !Ref "AWS::StackId"
+      RoleName: !Sub '${AWS::StackName}-s3-cleanup-role'
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
           - Effect: "Allow"
             Principal:
-              Service:
-                - "lambda.amazonaws.com"
-            Action:
-              - "sts:AssumeRole"
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
       ManagedPolicyArns:
-        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
         - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: "S3DeletePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                  - "s3:DeleteBucket"
+                Resource:
+                  - !Sub "arn:aws:s3:::${SecureS3Bucket}"
+                  - !Sub "arn:aws:s3:::${SecureS3Bucket}/*"
+                  - !Sub "arn:aws:s3:::${LoggingBucket}"
+                  - !Sub "arn:aws:s3:::${LoggingBucket}/*"
+              - Effect: "Allow"
+                Action:
+                  - "kms:Decrypt"
+                Resource: !GetAtt SecureCloudTrailKMSKey.Arn
 
+  # S3 cleanup Lambda function
   DeleteS3LambdaFunction:
     Type: AWS::Lambda::Function
     Properties:
-      Timeout: 120
-      Runtime: python3.11
+      FunctionName: !Sub '${AWS::StackName}-s3-cleanup'
+      Timeout: 300
+      Runtime: python3.12
       Handler: "index.handler"
+      Role: !GetAtt S3DeleteLambdaExecutionRole.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
       Environment:
         Variables:
-          Account: !Ref AWS::AccountId
-          S3BucketName: !Ref S3Bucket
-      Role: !GetAtt MyLambdaDeleteS3ExecutionRole.Arn
+          MAIN_BUCKET: !Ref SecureS3Bucket
+          LOGGING_BUCKET: !Ref LoggingBucket
+          ACCOUNT_ID: !Ref AWS::AccountId
       Code:
         ZipFile: |
           import boto3
           import cfnresponse
           import os
-          def handler(event, context):
-            responseData = {}
-            if event["RequestType"] == "Delete":
+          
+          def empty_bucket(s3_client, bucket_name):
               try:
-                s3 = boto3.resource('s3')
-                bucket = s3.Bucket(os.environ['S3BucketName'])
-                bucket.objects.all().delete()
-                bucket.delete(ExpectedBucketOwner=os.environ['Account'])
-                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
-                return
-              except:
-                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
-                return
-            else:
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
-              return
+                  # List all objects and delete them
+                  paginator = s3_client.get_paginator('list_objects_v2')
+                  for page in paginator.paginate(Bucket=bucket_name):
+                      if 'Contents' in page:
+                          objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                          if objects:
+                              s3_client.delete_objects(Bucket=bucket_name, Delete={'Objects': objects})
+                  
+                  # List and delete all object versions
+                  paginator = s3_client.get_paginator('list_object_versions')
+                  for page in paginator.paginate(Bucket=bucket_name):
+                      objects_to_delete = []
+                      
+                      if 'Versions' in page:
+                          for version in page['Versions']:
+                              objects_to_delete.append({
+                                  'Key': version['Key'],
+                                  'VersionId': version['VersionId']
+                              })
+                      
+                      if 'DeleteMarkers' in page:
+                          for marker in page['DeleteMarkers']:
+                              objects_to_delete.append({
+                                  'Key': marker['Key'],
+                                  'VersionId': marker['VersionId']
+                              })
+                      
+                      if objects_to_delete:
+                          s3_client.delete_objects(
+                              Bucket=bucket_name,
+                              Delete={'Objects': objects_to_delete}
+                          )
+                  
+                  print(f"Successfully emptied bucket: {bucket_name}")
+                  return True
+              
+              except Exception as e:
+                  print(f"Error emptying bucket {bucket_name}: {str(e)}")
+                  return False
+          
+          def handler(event, context):
+              s3_client = boto3.client('s3')
+              responseData = {}
+              
+              try:
+                  if event["RequestType"] == "Delete":
+                      main_bucket = os.environ['MAIN_BUCKET']
+                      logging_bucket = os.environ['LOGGING_BUCKET']
+                      
+                      # Empty both buckets
+                      main_success = empty_bucket(s3_client, main_bucket)
+                      logging_success = empty_bucket(s3_client, logging_bucket)
+                      
+                      if main_success and logging_success:
+                          print("All buckets emptied successfully")
+                      else:
+                          print("Some buckets failed to empty")
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              
+              except Exception as e:
+                  print(f"Error in cleanup function: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)  # Continue deletion
 
   DeleteS3CustomResource:
     Type: Custom::DeleteS3
     Properties:
       ServiceToken: !GetAtt DeleteS3LambdaFunction.Arn
-      ServiceTimeout: 120
+      ServiceTimeout: 300
+
+  # WAFR OPS-08: CloudWatch Alarms for monitoring
+  CloudTrailErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-cloudtrail-errors'
+      AlarmDescription: 'Alarm when CloudTrail has errors'
+      MetricName: ErrorCount
+      Namespace: AWS/CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecureAlarmTopic
+
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-unauthorized-api-calls'
+      AlarmDescription: 'Alarm for unauthorized API calls'
+      MetricName: UnauthorizedAPICalls
+      Namespace: CloudTrailMetrics
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecureAlarmTopic
+
+Conditions:
+  EnableDataEventsCondition: !Equals [!Ref EnableDataEvents, 'true']
+
 Outputs:
-  WARTestTrailId:
-    Description: CloudTrail ID
-    Value: !Ref WARTestTrail
-  WARTestTrailArn:
-    Description: CloudTrail Arn
-    Value: !GetAtt "WARTestTrail.Arn"
-  S3BucketName:
-    Description: S3 Bucket Name
-    Value:
-      Ref: S3Bucket
-  S3BucketArn:
-    Description: S3 Bucket Arn
-    Value: !GetAtt "S3Bucket.Arn"
-  AccountIdRegion:
-    Description: AccountIdRegion
-    Value: !Join ["", [!Ref AWS::AccountId, "/", !Ref AWS::Region]]
+  SecureCloudTrailId:
+    Description: Secure CloudTrail ID
+    Value: !Ref SecureCloudTrail
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailId'
+  
+  SecureCloudTrailArn:
+    Description: Secure CloudTrail ARN
+    Value: !GetAtt SecureCloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+  
+  SecureS3BucketName:
+    Description: Secure S3 Bucket Name
+    Value: !Ref SecureS3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+  
+  SecureS3BucketArn:
+    Description: Secure S3 Bucket ARN
+    Value: !GetAtt SecureS3Bucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketArn'
+  
+  SecureKMSKeyId:
+    Description: Secure KMS Key ID
+    Value: !Ref SecureCloudTrailKMSKey
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyId'
+  
   CloudTrailLogGroupName:
-    Description: CloudTrail log group
-    Value:
-      Ref: CloudTrailLogGroup
+    Description: CloudTrail Log Group Name
+    Value: !Ref CloudTrailLogGroup
     Export:
       Name: CLOUDTRAILLOGGROUP
-  AlarmTopicID:
-    Description: Alarm Topic ID
-    Value:
-      Ref: AlarmTopic
+  
+  SecureAlarmTopicArn:
+    Description: Secure Alarm Topic ARN
+    Value: !Ref SecureAlarmTopic
     Export:
       Name: ALARMTOPICID
+  
+  AccountIdRegion:
+    Description: Account ID and Region
+    Value: !Sub '${AWS::AccountId}/${AWS::Region}'

@@ -8,7 +8,40 @@ Parameters:
     Description: Amazon EC2 instance type for the instances
     Type: String
     Default: t3.nano
+  AllowedCidrRange:
+    Description: CIDR range for SSH access (restrict to your organization)
+    Type: String
+    Default: 10.0.0.0/8
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$'
+
 Resources:
+  # WAFR SEC-08: KMS Key for EBS encryption
+  EBSKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for EBS encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  EBSKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-ebs-key'
+      TargetKeyId: !Ref EBSKMSKey
+
   myLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties: 
@@ -16,101 +49,187 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
+        # WAFR SEC-08: Enable EBS encryption
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 20
+              Encrypted: true
+              KmsKeyId: !Ref EBSKMSKey
+        # WAFR OPS-08: Enable detailed monitoring
+        Monitoring:
+          Enabled: true
+        # WAFR SEC-03: Use IMDSv2 for enhanced security
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+          HttpPutResponseHopLimit: 2
+        SecurityGroupIds:
+          - !Ref SecureSecurityGroup
+
   ASGwithLaunchTemplate:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      AutoScalingGroupName: 'wafr-test-non-compliant-asgggg'
+      AutoScalingGroupName: !Sub '${AWS::StackName}-secure-asg'
       LaunchTemplate:
         LaunchTemplateId: !Ref myLaunchTemplate
         Version: !GetAtt myLaunchTemplate.LatestVersionNumber
-      MaxSize: '0'
-      MinSize: '0'
+      MaxSize: '3'
+      MinSize: '1'
+      DesiredCapacity: '2'
       VPCZoneIdentifier:
         - !ImportValue SubnetAID
         - !ImportValue SubnetBID
-  ASGwithLaunchConfig:
-    Type: "AWS::AutoScaling::AutoScalingGroup"
-    Properties:
-      VPCZoneIdentifier:
-        - !ImportValue SubnetAID
-        - !ImportValue SubnetBID   
-      LaunchConfigurationName: !Ref MyLaunchConfiguration
-      MinSize: "0"
-      MaxSize: "0"
-      DesiredCapacity: "0"
+      # WAFR REL-05: Enable health checks
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      # WAFR OPS-08: Enable instance refresh for updates
+      InstanceRefreshPolicy:
+        InstanceWarmup: 300
+        MinHealthyPercentage: 50
+      # WAFR OPS-05: Add meaningful tags
+      Tags:
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+        - Key: Application
+          Value: WAFR-Compliant-ASG
+          PropagateAtLaunch: true
 
-  MyLaunchConfiguration:
-    Type: "AWS::AutoScaling::LaunchConfiguration"
-    Properties:
-      ImageId: !Ref LatestAmiId
-      InstanceType: !Ref InstanceType
-      SecurityGroups: 
-        - !Ref MySecurityGroup
-
-  MySecurityGroup:
+  # WAFR SEC-05: Secure Security Group - restrict access
+  SecureSecurityGroup:
     Type: "AWS::EC2::SecurityGroup"
     Properties:
-      GroupDescription: "Enable SSH access and HTTP access on the inbound port"
+      GroupDescription: "WAFR Compliant - Restricted access security group"
       VpcId: !ImportValue VPCID
       SecurityGroupIngress: 
+        # SSH access restricted to specific CIDR range
         - IpProtocol: "tcp"
           FromPort: "22"
           ToPort: "22"
-          CidrIp: "0.0.0.0/0"
+          CidrIp: !Ref AllowedCidrRange
+          Description: "SSH access from trusted network only"
+        # HTTP access through ALB only (remove direct access)
+        # - IpProtocol: "tcp"
+        #   FromPort: "80"
+        #   ToPort: "80"
+        #   SourceSecurityGroupId: !Ref ALBSecurityGroup
+        #   Description: "HTTP access from ALB only"
+      # WAFR SEC-05: Explicit egress rules
+      SecurityGroupEgress:
         - IpProtocol: "tcp"
           FromPort: "80"
           ToPort: "80"
           CidrIp: "0.0.0.0/0"
+          Description: "HTTP outbound for package updates"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS outbound for package updates"
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-secure-sg'
+        - Key: Purpose
+          Value: 'WAFR-Compliant'
 
+  # WAFR SEC-03: Least privilege IAM role
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Path: "/"
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      # WAFR SEC-03: Specific permissions instead of wildcard
       Policies:
-        - PolicyName: root
+        - PolicyName: ASGReadOnlyPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: arn:aws:logs:*:*:*
-              - Effect: Allow
-                Action:
                   - autoscaling:DescribeAutoScalingGroups
-                Resource: "*"
+                Resource: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*'
+                Condition:
+                  StringEquals:
+                    'autoscaling:ResourceTag/Application': 'WAFR-Compliant-ASG'
+
+  # WAFR REL-07: Add Dead Letter Queue
+  ASGFunctionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-asg-function-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      # WAFR SEC-08: Enable encryption
+      KmsMasterKeyId: alias/aws/sqs
 
   myASGFunction:
     Type: AWS::Lambda::Function
     Properties:
+      FunctionName: !Sub '${AWS::StackName}-asg-function'
       Handler: index.handler
       Role: !GetAtt 'LambdaExecutionRole.Arn'
+      Runtime: python3.11
+      Timeout: 30
+      # WAFR REL-07: Configure Dead Letter Queue
+      DeadLetterConfig:
+        TargetArn: !GetAtt ASGFunctionDLQ.Arn
+      # WAFR SEC-08: Enable encryption at rest
+      KmsKeyArn: !GetAtt EBSKMSKey.Arn
+      # WAFR OPS-08: Enable X-Ray tracing
+      TracingConfig:
+        Mode: Active
       Code:
         ZipFile: |
           import boto3
           import cfnresponse
+          import json
+          
           def handler(event, context):
-              client = boto3.client('autoscaling')
-              response = client.describe_auto_scaling_groups(
-                  AutoScalingGroupNames=[
-                    'wafr-test-non-compliant-asgggg'
-                  ]
-              )
-              responseData = {'AutoScalingGroupARN': response['AutoScalingGroups'][0]['AutoScalingGroupARN']}
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
-      Runtime: python3.11
-      Timeout: '30'
+              try:
+                  client = boto3.client('autoscaling')
+                  stack_name = event.get('StackId', '').split('/')[-2]
+                  asg_name = f'{stack_name}-secure-asg'
+                  
+                  response = client.describe_auto_scaling_groups(
+                      AutoScalingGroupNames=[asg_name]
+                  )
+                  
+                  if response['AutoScalingGroups']:
+                      asg_arn = response['AutoScalingGroups'][0]['AutoScalingGroupARN']
+                      responseData = {'AutoScalingGroupARN': asg_arn}
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, 'ASG not found')
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, str(e))
+
+  # WAFR OPS-08: CloudWatch Alarm for ASG monitoring
+  ASGHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-asg-high-cpu'
+      AlarmDescription: 'Alarm when ASG CPU exceeds 80%'
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref ASGwithLaunchTemplate
+
   MyASGFunctionCall:
     Type: Custom::MyASGFunction
     Properties:
@@ -120,9 +239,12 @@ Outputs:
   ASGwithLaunchTemplateARN:
     Description: Auto Scaling Group with launch template ARN.
     Value: !GetAtt 'MyASGFunctionCall.AutoScalingGroupARN'
-  ASGwithLaunchConfigID:
-    Description: Auto Scaling Group with launch config ID
-    Value: !Ref ASGwithLaunchConfig
+  SecureSecurityGroupId:
+    Description: Secure Security Group ID
+    Value: !Ref SecureSecurityGroup
+  EBSKMSKeyId:
+    Description: KMS Key for EBS encryption
+    Value: !Ref EBSKMSKey
   AccountIdRegion:
     Description: AccountIdRegion
     Value: !Join ["", [!Ref AWS::AccountId, "/", !Ref AWS::Region]]
