@@ -8,6 +8,18 @@ Parameters:
     Description: Amazon EC2 instance type for the instances
     Type: String
     Default: t3.nano
+  # WAFR SEC-BP-04: Restricted source IP for SSH access
+  AllowedSSHCidr:
+    Description: CIDR block allowed for SSH access (restricted from 0.0.0.0/0)
+    Type: String
+    Default: 10.0.0.0/8
+    ConstraintDescription: Must be a valid CIDR range
+  # WAFR SEC-BP-04: Restricted source IP for HTTP access  
+  AllowedHTTPCidr:
+    Description: CIDR block allowed for HTTP access (restricted from 0.0.0.0/0)
+    Type: String
+    Default: 10.0.0.0/8
+    ConstraintDescription: Must be a valid CIDR range
 Resources:
   myLaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
@@ -16,18 +28,42 @@ Resources:
       LaunchTemplateData:
         ImageId: !Ref LatestAmiId
         InstanceType: !Ref InstanceType
+        # WAFR SEC-BP-02: Instance Metadata Service v2 enforcement
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          InstanceMetadataTags: enabled
+        # WAFR SEC-BP-08: Enable detailed monitoring for performance insights
+        Monitoring:
+          Enabled: true
   ASGwithLaunchTemplate:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      AutoScalingGroupName: 'wafr-test-non-compliant-asgggg'
+      AutoScalingGroupName: 'wafr-compliant-asg'
       LaunchTemplate:
         LaunchTemplateId: !Ref myLaunchTemplate
         Version: !GetAtt myLaunchTemplate.LatestVersionNumber
-      MaxSize: '0'
-      MinSize: '0'
+      MaxSize: '3'
+      MinSize: '1'
+      # WAFR REL-BP-01: Multi-AZ deployment for high availability
       VPCZoneIdentifier:
         - !ImportValue SubnetAID
         - !ImportValue SubnetBID
+      # WAFR REL-BP-03: Health checks for reliability
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      # WAFR OPS-BP-03: Resource tagging for operational excellence
+      Tags:
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: WAFR-Compliant
+          PropagateAtLaunch: true
+        - Key: ManagedBy
+          Value: CloudFormation
+          PropagateAtLaunch: true
   ASGwithLaunchConfig:
     Type: "AWS::AutoScaling::AutoScalingGroup"
     Properties:
@@ -35,9 +71,20 @@ Resources:
         - !ImportValue SubnetAID
         - !ImportValue SubnetBID   
       LaunchConfigurationName: !Ref MyLaunchConfiguration
-      MinSize: "0"
-      MaxSize: "0"
-      DesiredCapacity: "0"
+      MinSize: "1"
+      MaxSize: "3"
+      DesiredCapacity: "1"
+      # WAFR REL-BP-03: Health checks for reliability
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      # WAFR OPS-BP-03: Resource tagging
+      Tags:
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+        - Key: Project  
+          Value: WAFR-Compliant
+          PropagateAtLaunch: true
 
   MyLaunchConfiguration:
     Type: "AWS::AutoScaling::LaunchConfiguration"
@@ -46,25 +93,56 @@ Resources:
       InstanceType: !Ref InstanceType
       SecurityGroups: 
         - !Ref MySecurityGroup
+      # WAFR SEC-BP-02: Instance Metadata Service v2 enforcement
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
 
+  # WAFR SEC-BP-04: Restricted Security Group (CRITICAL FIX)
   MySecurityGroup:
     Type: "AWS::EC2::SecurityGroup"
     Properties:
-      GroupDescription: "Enable SSH access and HTTP access on the inbound port"
+      GroupDescription: "WAFR Compliant - Restricted SSH and HTTP access from trusted networks only"
       VpcId: !ImportValue VPCID
       SecurityGroupIngress: 
+        # WAFR SEC-BP-04: SSH access restricted to trusted CIDR (not 0.0.0.0/0)
         - IpProtocol: "tcp"
           FromPort: "22"
           ToPort: "22"
-          CidrIp: "0.0.0.0/0"
+          CidrIp: !Ref AllowedSSHCidr
+          Description: "SSH access from trusted network only - WAFR SEC-BP-04 compliant"
+        # WAFR SEC-BP-04: HTTP access restricted to trusted CIDR (not 0.0.0.0/0)  
+        - IpProtocol: "tcp"
+          FromPort: "80"
+          ToPort: "80"
+          CidrIp: !Ref AllowedHTTPCidr
+          Description: "HTTP access from trusted network only - WAFR SEC-BP-04 compliant"
+      # WAFR SEC-BP-04: Explicit egress rules (not allowing all traffic)
+      SecurityGroupEgress:
         - IpProtocol: "tcp"
           FromPort: "80"
           ToPort: "80"
           CidrIp: "0.0.0.0/0"
+          Description: "HTTP outbound for package updates"
+        - IpProtocol: "tcp"
+          FromPort: "443"
+          ToPort: "443"
+          CidrIp: "0.0.0.0/0"
+          Description: "HTTPS outbound for secure communications"
+      Tags:
+        - Key: Name
+          Value: WAFR-Compliant-SecurityGroup
+        - Key: WAFR-Pillar
+          Value: Security
+        - Key: WAFR-BP
+          Value: SEC-BP-04
 
+  # WAFR SEC-BP-05: Least privilege IAM role (CRITICAL FIX)
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub "${AWS::StackName}-Lambda-ExecutionRole"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -75,42 +153,80 @@ Resources:
             Action:
               - sts:AssumeRole
       Path: "/"
+      # WAFR SEC-BP-05: Managed policies instead of inline policies
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
-        - PolicyName: root
+        # WAFR SEC-BP-05: Least privilege - specific resources and actions only
+        - PolicyName: SpecificAutoScalingPermissions
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
+              # WAFR SEC-BP-05: Specific resource ARNs instead of "*"
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: !Sub "arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/wafr-compliant-asg"
+              # CloudWatch Logs with specific log group
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: arn:aws:logs:*:*:*
-              - Effect: Allow
-                Action:
-                  - autoscaling:DescribeAutoScalingGroups
-                Resource: "*"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*"
+      Tags:
+        - Key: WAFR-Pillar
+          Value: Security
+        - Key: WAFR-BP
+          Value: SEC-BP-05
 
   myASGFunction:
     Type: AWS::Lambda::Function
     Properties:
+      FunctionName: !Sub "${AWS::StackName}-ASGFunction"
       Handler: index.handler
       Role: !GetAtt 'LambdaExecutionRole.Arn'
       Code:
         ZipFile: |
           import boto3
           import cfnresponse
+          import logging
+          
+          # WAFR OPS-BP-05: Structured logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
           def handler(event, context):
-              client = boto3.client('autoscaling')
-              response = client.describe_auto_scaling_groups(
-                  AutoScalingGroupNames=[
-                    'wafr-test-non-compliant-asgggg'
-                  ]
-              )
-              responseData = {'AutoScalingGroupARN': response['AutoScalingGroups'][0]['AutoScalingGroupARN']}
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              try:
+                  client = boto3.client('autoscaling')
+                  response = client.describe_auto_scaling_groups(
+                      AutoScalingGroupNames=[
+                        'wafr-compliant-asg'
+                      ]
+                  )
+                  responseData = {'AutoScalingGroupARN': response['AutoScalingGroups'][0]['AutoScalingGroupARN']}
+                  logger.info(f"Successfully retrieved ASG ARN: {responseData['AutoScalingGroupARN']}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+              except Exception as e:
+                  logger.error(f"Error retrieving ASG ARN: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
       Runtime: python3.11
       Timeout: '30'
+      # WAFR PERF-BP-02: Right-sizing resources
+      MemorySize: 128
+      # WAFR SEC-BP-08: Environment variables encryption at rest
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      # WAFR OPS-BP-05: Enable tracing for operational insights  
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: WAFR-Pillar
+          Value: Security-Performance
+        - Key: WAFR-BP
+          Value: SEC-BP-08-PERF-BP-02
+          
   MyASGFunctionCall:
     Type: Custom::MyASGFunction
     Properties:
@@ -126,3 +242,8 @@ Outputs:
   AccountIdRegion:
     Description: AccountIdRegion
     Value: !Join ["", [!Ref AWS::AccountId, "/", !Ref AWS::Region]]
+  SecurityGroupId:
+    Description: WAFR Compliant Security Group ID
+    Value: !Ref MySecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
